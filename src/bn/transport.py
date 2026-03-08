@@ -2,28 +2,17 @@ from __future__ import annotations
 
 import contextlib
 import json
-import os
 import socket
-import sys
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .paths import bridge_registry_path, registry_dir
+from .paths import bridge_registry_path
 
 
 class BridgeError(RuntimeError):
     pass
-
-
-def _debug_enabled() -> bool:
-    return os.environ.get("BN_DEBUG_DISCOVERY") == "1"
-
-
-def _debug(message: str) -> None:
-    if _debug_enabled():
-        sys.stderr.write(f"[bn-debug] {message}\n")
 
 
 @dataclass(slots=True)
@@ -45,40 +34,33 @@ def _purge_stale_registry(registry_path: Path) -> None:
     with contextlib.suppress(OSError):
         registry_path.unlink()
 
+
 def _socket_is_live(socket_path: Path, timeout: float = 0.2) -> bool:
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
             sock.settimeout(timeout)
             sock.connect(str(socket_path))
         return True
-    except OSError as exc:
-        _debug(f"socket connect failed for {socket_path}: {type(exc).__name__}: {exc}")
+    except OSError:
         return False
-    finally:
-        _debug(f"socket probe completed for {socket_path}")
 
 
 def _load_instance(path: Path) -> BridgeInstance | None:
-    _debug(f"loading registry {path}")
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
         socket_path = Path(payload["socket_path"])
         pid = int(payload["pid"])
     except (OSError, ValueError, KeyError, json.JSONDecodeError):
-        _debug(f"failed to parse registry {path}")
         return None
 
     if not socket_path.exists():
-        _debug(f"socket missing for registry {path}: {socket_path}")
         _purge_stale_registry(path)
         return None
 
     if not _socket_is_live(socket_path):
-        _debug(f"socket {socket_path} not live for registry {path}")
         _purge_stale_registry(path)
         return None
 
-    _debug(f"accepted registry {path} for pid {pid}")
     return BridgeInstance(
         pid=pid,
         socket_path=socket_path,
@@ -92,36 +74,13 @@ def _load_instance(path: Path) -> BridgeInstance | None:
 
 def list_instances() -> list[BridgeInstance]:
     fixed_registry = bridge_registry_path()
-    legacy_root = registry_dir()
-    _debug(
-        "list_instances "
-        f"executable={sys.executable} "
-        f"prefix={sys.prefix} "
-        f"base_prefix={sys.base_prefix} "
-        f"cwd={Path.cwd()} "
-        f"fixed_registry={fixed_registry} "
-        f"legacy_registry_dir={legacy_root}"
-    )
-
-    registry_paths: list[Path] = []
-    if fixed_registry.exists():
-        registry_paths.append(fixed_registry)
-    elif not legacy_root.exists():
-        _debug("no bridge registry paths exist")
+    if not fixed_registry.exists():
         return []
 
-    if legacy_root.exists():
-        registry_paths.extend(sorted(legacy_root.glob("*.json")))
-
     instances: list[BridgeInstance] = []
-    seen: set[Path] = set()
-    for path in registry_paths:
-        if path in seen:
-            continue
-        seen.add(path)
-        instance = _load_instance(path)
-        if instance is not None:
-            instances.append(instance)
+    instance = _load_instance(fixed_registry)
+    if instance is not None:
+        instances.append(instance)
     return instances
 
 

@@ -39,14 +39,14 @@ def test_send_request_uses_registry_and_socket(tmp_path, monkeypatch):
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     pid = os.getpid()
     socket_path = Path("/tmp") / f"bn-test-{os.getpid()}-{uuid.uuid4().hex[:8]}.sock"
-    registry_dir = tmp_path / "instances"
-    registry_dir.mkdir(parents=True)
+    registry_path = bridge_registry_path()
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
 
     server = _Server(str(socket_path), _Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
 
-    (registry_dir / "123.json").write_text(
+    registry_path.write_text(
         json.dumps(
             {
                 "pid": pid,
@@ -75,15 +75,15 @@ def test_send_request_uses_registry_and_socket(tmp_path, monkeypatch):
 def test_choose_instance_accepts_pid_prefixed_human_selector(tmp_path, monkeypatch):
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     pid = os.getpid()
-    registry_dir = tmp_path / "instances"
-    registry_dir.mkdir(parents=True)
+    registry_path = bridge_registry_path()
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
 
     socket_path = Path("/tmp") / f"bn-test-{os.getpid()}-{uuid.uuid4().hex[:8]}.sock"
     server = _Server(str(socket_path), _Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
 
-    (registry_dir / "456.json").write_text(
+    registry_path.write_text(
         json.dumps(
             {
                 "pid": pid,
@@ -105,8 +105,8 @@ def test_choose_instance_accepts_pid_prefixed_human_selector(tmp_path, monkeypat
 
 def test_list_instances_prunes_stale_registry_and_socket(tmp_path, monkeypatch):
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
-    registry_dir = tmp_path / "instances"
-    registry_dir.mkdir(parents=True)
+    registry_path = bridge_registry_path()
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
 
     stale_socket_path = Path("/tmp") / f"bn-stale-{os.getpid()}-{uuid.uuid4().hex[:8]}.sock"
     stale_server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -114,7 +114,6 @@ def test_list_instances_prunes_stale_registry_and_socket(tmp_path, monkeypatch):
     stale_server.listen(1)
     stale_server.close()
 
-    registry_path = registry_dir / "789.json"
     registry_path.write_text(
         json.dumps(
             {
@@ -156,15 +155,14 @@ def test_send_request_wraps_socket_errors(tmp_path, monkeypatch):
 
 def test_list_instances_trusts_live_socket_even_with_stale_pid(tmp_path, monkeypatch):
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
-    registry_dir = tmp_path / "instances"
-    registry_dir.mkdir(parents=True)
+    registry_path = bridge_registry_path()
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
 
     socket_path = Path("/tmp") / f"bn-live-{os.getpid()}-{uuid.uuid4().hex[:8]}.sock"
     server = _Server(str(socket_path), _Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
 
-    registry_path = registry_dir / "111.json"
     registry_path.write_text(
         json.dumps(
             {

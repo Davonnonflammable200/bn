@@ -39,10 +39,6 @@ def _cache_home() -> Path:
     return Path.home() / "Library" / "Caches" / "bn"
 
 
-def _registry_dir() -> Path:
-    return _cache_home() / "instances"
-
-
 def _spill_dir() -> Path:
     now = datetime.now(timezone.utc)
     path = _cache_home() / "bridge-artifacts" / now.strftime("%Y%m%d")
@@ -56,20 +52,6 @@ def _registry_path() -> Path:
 
 def _socket_path() -> Path:
     return _cache_home() / f"{PLUGIN_NAME}.sock"
-
-
-def _cleanup_legacy_bridge_files() -> None:
-    legacy_dir = _registry_dir()
-    if legacy_dir.exists():
-        for path in legacy_dir.glob("*.json"):
-            with contextlib.suppress(OSError):
-                path.unlink()
-        with contextlib.suppress(OSError):
-            legacy_dir.rmdir()
-
-    for path in _cache_home().glob(f"{PLUGIN_NAME}-*.sock"):
-        with contextlib.suppress(OSError):
-            path.unlink()
 
 
 def _json_response(*, ok: bool, result: Any = None, error: str | None = None) -> dict[str, Any]:
@@ -396,7 +378,6 @@ class BinaryNinjaBridge:
         self._thread: threading.Thread | None = None
 
     def start(self):  # pragma: no cover - requires GUI runtime
-        _cleanup_legacy_bridge_files()
         self.socket_path.parent.mkdir(parents=True, exist_ok=True)
         if self.socket_path.exists():
             self.socket_path.unlink()

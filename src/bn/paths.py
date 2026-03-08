@@ -31,10 +31,6 @@ def cache_home() -> Path:
     return home / ".cache" / "bn"
 
 
-def registry_dir() -> Path:
-    return cache_home() / "instances"
-
-
 def bridge_registry_path() -> Path:
     return cache_home() / f"{PLUGIN_NAME}.json"
 
