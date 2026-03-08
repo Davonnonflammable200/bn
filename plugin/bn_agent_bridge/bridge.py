@@ -1,0 +1,1065 @@
+from __future__ import annotations
+
+import atexit
+import contextlib
+import difflib
+import hashlib
+import io
+import json
+import os
+import re
+import shutil
+import socketserver
+import threading
+import traceback
+import weakref
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import binaryninja as bn
+from binaryninja.mainthread import execute_on_main_thread_and_wait
+from binaryninja.plugin import PluginCommand
+
+try:
+    import binaryninjaui as ui
+except ImportError:  # pragma: no cover - GUI plugin only
+    ui = None
+
+
+VERSION = "0.1.0"
+PLUGIN_NAME = "bn_agent_bridge"
+
+
+def _cache_home() -> Path:
+    base = os.environ.get("BN_CACHE_DIR")
+    if base:
+        return Path(base).expanduser()
+    return Path.home() / "Library" / "Caches" / "bn"
+
+
+def _registry_dir() -> Path:
+    return _cache_home() / "instances"
+
+
+def _spill_dir() -> Path:
+    now = datetime.now(timezone.utc)
+    path = _cache_home() / "bridge-artifacts" / now.strftime("%Y%m%d")
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _registry_path() -> Path:
+    return _registry_dir() / f"{os.getpid()}.json"
+
+
+def _socket_path() -> Path:
+    return _cache_home() / f"{PLUGIN_NAME}-{os.getpid()}.sock"
+
+
+def _json_response(*, ok: bool, result: Any = None, error: str | None = None) -> dict[str, Any]:
+    return {"ok": ok, "result": result, "error": error}
+
+
+def _run_on_main_thread(func):
+    holder: dict[str, Any] = {}
+
+    def wrapper():
+        try:
+            holder["result"] = func()
+        except Exception as exc:  # pragma: no cover - exercised inside GUI
+            holder["error"] = exc
+            holder["traceback"] = traceback.format_exc()
+
+    execute_on_main_thread_and_wait(wrapper)
+    if "error" in holder:
+        exc = holder["error"]
+        if "traceback" in holder:
+            bn.log_error(holder["traceback"])
+        raise exc
+    return holder.get("result")
+
+
+def _parse_address(value: Any) -> int:
+    if isinstance(value, int):
+        return value
+    text = str(value).strip()
+    if text.lower().startswith("0x"):
+        return int(text, 16)
+    return int(text, 10)
+
+
+def _clean_bytes(text: str) -> bytes:
+    cleaned = re.sub(r"[^0-9a-fA-F]", "", text)
+    if len(cleaned) % 2:
+        raise ValueError("Hex byte string must have an even number of nybbles")
+    return bytes.fromhex(cleaned)
+
+
+def _write_text_artifact(path_text: str | None, payload: Any) -> dict[str, Any] | None:
+    if not path_text:
+        return None
+
+    path = Path(path_text).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
+    path.write_bytes(data)
+    return {
+        "artifact_path": str(path),
+        "bytes": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+    }
+
+
+def _active_binary_view():
+    if ui is None:
+        return None
+    try:
+        context = ui.UIContext.activeContext()
+        if context is None:
+            return None
+        frame = context.getCurrentViewFrame()
+        if frame is None:
+            return None
+        if hasattr(frame, "getCurrentBinaryView"):
+            return frame.getCurrentBinaryView()
+        if hasattr(frame, "getBinaryView"):
+            return frame.getBinaryView()
+    except Exception:
+        return None
+    return None
+
+
+def _collect_open_views() -> list[Any]:
+    if ui is None:
+        active = _active_binary_view()
+        return [active] if active is not None else []
+
+    found: list[Any] = []
+    contexts = []
+    try:
+        contexts = list(ui.UIContext.allContexts())
+    except Exception:
+        pass
+    if not contexts:
+        active_context = ui.UIContext.activeContext()
+        if active_context is not None:
+            contexts = [active_context]
+
+    def collect_from_frame(frame):
+        if frame is None:
+            return
+        for attr in ("getCurrentBinaryView", "getBinaryView"):
+            try:
+                getter = getattr(frame, attr, None)
+                if callable(getter):
+                    value = getter()
+                    if value is not None:
+                        found.append(value)
+            except Exception:
+                continue
+
+    for context in contexts:
+        try:
+            collect_from_frame(context.getCurrentViewFrame())
+        except Exception:
+            pass
+        for attr in ("getViewFrames", "viewFrames", "allViewFrames", "frames"):
+            try:
+                getter = getattr(context, attr, None)
+                frames = getter() if callable(getter) else getter
+                if frames:
+                    for frame in list(frames):
+                        collect_from_frame(frame)
+            except Exception:
+                continue
+
+    unique: list[Any] = []
+    seen: set[int] = set()
+    for bv in found:
+        marker = id(bv)
+        if marker not in seen:
+            seen.add(marker)
+            unique.append(bv)
+    return unique
+
+
+@dataclass(slots=True)
+class TargetRecord:
+    view_id: str
+    ref: weakref.ReferenceType
+    session_id: str
+    filename: str
+    basename: str
+    view_name: str
+
+    def target_id(self) -> str:
+        return f"{os.getpid()}:{self.view_id}:{self.session_id}"
+
+
+class TargetManager:
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._records: dict[str, TargetRecord] = {}
+        self._ids_by_object: dict[int, str] = {}
+        self._next_id = 1
+
+    def _view_name(self, bv) -> str:
+        for attr in ("view_type", "name"):
+            try:
+                value = getattr(bv, attr, None)
+                if value:
+                    return str(getattr(value, "name", value))
+            except Exception:
+                continue
+        return type(bv).__name__
+
+    def refresh(self) -> list[dict[str, Any]]:
+        views = _collect_open_views()
+        active = _active_binary_view()
+
+        with self._lock:
+            alive: dict[str, TargetRecord] = {}
+            for bv in views:
+                key = id(bv)
+                view_id = self._ids_by_object.get(key)
+                if view_id is None:
+                    view_id = str(self._next_id)
+                    self._next_id += 1
+                    self._ids_by_object[key] = view_id
+
+                try:
+                    session_id = str(bv.file.session_id)
+                except Exception:
+                    session_id = str(key)
+                try:
+                    filename = str(getattr(bv.file, "filename", "")) if bv.file else ""
+                except Exception:
+                    filename = ""
+
+                alive[view_id] = TargetRecord(
+                    view_id=view_id,
+                    ref=weakref.ref(bv),
+                    session_id=session_id,
+                    filename=filename,
+                    basename=os.path.basename(filename) if filename else "",
+                    view_name=self._view_name(bv),
+                )
+
+            self._records = alive
+
+            result = []
+            for view_id in sorted(self._records, key=lambda item: int(item)):
+                record = self._records[view_id]
+                view = record.ref()
+                if view is None:
+                    continue
+                result.append(
+                    {
+                        "target_id": record.target_id(),
+                        "view_id": record.view_id,
+                        "session_id": record.session_id,
+                        "filename": record.filename,
+                        "basename": record.basename,
+                        "view_name": record.view_name,
+                        "active": bool(view is active),
+                    }
+                )
+            return result
+
+    def resolve(self, selector: str | None):
+        targets = self.refresh()
+        if not targets:
+            raise RuntimeError("No BinaryView targets are open in the GUI")
+
+        if selector in (None, "", "active"):
+            active = _active_binary_view()
+            if active is None:
+                raise RuntimeError("No active BinaryView is selected")
+            return active
+
+        text = str(selector).strip()
+        with self._lock:
+            for record in self._records.values():
+                if text in (
+                    record.target_id(),
+                    record.view_id,
+                    record.filename,
+                    record.basename,
+                ):
+                    view = record.ref()
+                    if view is not None:
+                        return view
+        raise RuntimeError(f"Unknown target selector: {selector}")
+
+
+class BridgeHandler(socketserver.StreamRequestHandler):
+    def handle(self):  # pragma: no cover - exercised from CLI
+        raw = self.rfile.readline()
+        if not raw:
+            return
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except json.JSONDecodeError:
+            response = _json_response(ok=False, error="Invalid JSON request")
+        else:
+            response = self.server.bridge.dispatch(payload)
+        encoded = json.dumps(response, sort_keys=True, default=str).encode("utf-8")
+        self.wfile.write(encoded)
+
+
+class ThreadedUnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self, socket_path: str, handler, bridge):
+        self.bridge = bridge
+        super().__init__(socket_path, handler)
+
+
+class BinaryNinjaBridge:
+    def __init__(self):
+        self.targets = TargetManager()
+        self.socket_path = _socket_path()
+        self.registry_path = _registry_path()
+        self._server: ThreadedUnixServer | None = None
+        self._thread: threading.Thread | None = None
+
+    def start(self):  # pragma: no cover - requires GUI runtime
+        _registry_dir().mkdir(parents=True, exist_ok=True)
+        self.socket_path.parent.mkdir(parents=True, exist_ok=True)
+        if self.socket_path.exists():
+            self.socket_path.unlink()
+
+        self._server = ThreadedUnixServer(str(self.socket_path), BridgeHandler, self)
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+        self._write_registry()
+        bn.log_info(f"BN Agent Bridge listening on {self.socket_path}")
+
+    def stop(self):  # pragma: no cover - requires GUI runtime
+        if self._server is not None:
+            with contextlib.suppress(Exception):
+                self._server.shutdown()
+            with contextlib.suppress(Exception):
+                self._server.server_close()
+        if self.socket_path.exists():
+            with contextlib.suppress(OSError):
+                self.socket_path.unlink()
+        if self.registry_path.exists():
+            with contextlib.suppress(OSError):
+                self.registry_path.unlink()
+
+    def _write_registry(self):
+        payload = {
+            "pid": os.getpid(),
+            "socket_path": str(self.socket_path),
+            "plugin_name": PLUGIN_NAME,
+            "plugin_version": VERSION,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self.registry_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    def dispatch(self, payload: dict[str, Any]) -> dict[str, Any]:  # pragma: no cover - GUI runtime
+        op = payload.get("op")
+        params = payload.get("params") or {}
+        target = payload.get("target")
+        try:
+            result = _run_on_main_thread(lambda: self._dispatch_on_main(op, params, target))
+            return _json_response(ok=True, result=result)
+        except Exception as exc:
+            return _json_response(ok=False, error=f"{type(exc).__name__}: {exc}")
+
+    def _dispatch_on_main(self, op: str, params: dict[str, Any], target: str | None):
+        if op == "doctor":
+            return self._doctor()
+        if op == "list_targets":
+            return self.targets.refresh()
+        if op == "target_info":
+            return self._target_info(params.get("selector") or target)
+
+        if op == "list_functions":
+            return self._list_functions(target, params.get("offset", 0), params.get("limit", 100))
+        if op == "search_functions":
+            return self._search_functions(
+                target,
+                str(params.get("query", "")),
+                params.get("offset", 0),
+                params.get("limit", 100),
+            )
+        if op == "decompile":
+            return self._decompile(target, params["identifier"])
+        if op == "il":
+            return self._il(target, params["identifier"], str(params.get("view", "hlil")), bool(params.get("ssa")))
+        if op == "disasm":
+            return self._disasm(target, params["identifier"])
+        if op == "xrefs":
+            return self._xrefs(target, params["identifier"])
+        if op == "types":
+            return self._types(
+                target,
+                query=params.get("query"),
+                offset=int(params.get("offset", 0)),
+                limit=int(params.get("limit", 100)),
+            )
+        if op == "strings":
+            return self._strings(
+                target,
+                query=params.get("query"),
+                offset=int(params.get("offset", 0)),
+                limit=int(params.get("limit", 100)),
+            )
+        if op == "imports":
+            return self._imports(target)
+        if op == "data":
+            return self._data(
+                target,
+                offset=int(params.get("offset", 0)),
+                limit=int(params.get("limit", 100)),
+            )
+        if op == "bundle_function":
+            return self._bundle_function(target, params["identifier"], params.get("out_path"))
+        if op == "bundle_corpus":
+            return self._bundle_corpus(
+                target,
+                str(params["kind"]),
+                query=params.get("query"),
+                limit=int(params.get("limit", 500)),
+                out_path=params.get("out_path"),
+            )
+        if op == "py_exec":
+            return self._py_exec(target, str(params["script"]), params.get("out_path"))
+
+        if op == "rename_symbol":
+            return self._mutation(target, bool(params.get("preview")), [params])
+        if op == "set_comment":
+            return self._mutation(target, bool(params.get("preview")), [{"op": "set_comment", **params}])
+        if op == "delete_comment":
+            return self._mutation(target, bool(params.get("preview")), [{"op": "delete_comment", **params}])
+        if op == "set_prototype":
+            return self._mutation(target, bool(params.get("preview")), [{"op": "set_prototype", **params}])
+        if op == "local_rename":
+            return self._mutation(target, bool(params.get("preview")), [{"op": "local_rename", **params}])
+        if op == "local_retype":
+            return self._mutation(target, bool(params.get("preview")), [{"op": "local_retype", **params}])
+        if op == "struct_field_set":
+            return self._mutation(target, bool(params.get("preview")), [{"op": "struct_field_set", **params}])
+        if op == "struct_field_rename":
+            return self._mutation(target, bool(params.get("preview")), [{"op": "struct_field_rename", **params}])
+        if op == "struct_field_delete":
+            return self._mutation(target, bool(params.get("preview")), [{"op": "struct_field_delete", **params}])
+        if op == "struct_replace":
+            return self._mutation(target, bool(params.get("preview")), [{"op": "struct_replace", **params}])
+        if op == "patch_bytes":
+            return self._mutation(target, bool(params.get("preview")), [{"op": "patch_bytes", **params}])
+        if op == "batch_apply":
+            manifest = dict(params)
+            preview = bool(manifest.get("preview"))
+            target = str(manifest.get("target") or target)
+            operations = list(manifest.get("ops") or [])
+            return self._mutation(target, preview, operations)
+
+        raise ValueError(f"Unknown operation: {op}")
+
+    def _doctor(self):
+        return {
+            "plugin_name": PLUGIN_NAME,
+            "plugin_version": VERSION,
+            "pid": os.getpid(),
+            "socket_path": str(self.socket_path),
+            "targets": self.targets.refresh(),
+        }
+
+    def _target_info(self, selector: str | None):
+        bv = self.targets.resolve(selector)
+        record = None
+        for item in self.targets.refresh():
+            if item["active"] and selector in (None, "", "active"):
+                record = item
+                break
+            if selector and selector in (
+                item["target_id"],
+                item["view_id"],
+                item["filename"],
+                item["basename"],
+            ):
+                record = item
+                break
+        return {
+            **(record or {}),
+            "arch": str(getattr(bv, "arch", "")),
+            "platform": str(getattr(bv, "platform", "")),
+            "entry_point": hex(getattr(bv, "entry_point", 0)),
+        }
+
+    def _resolve_view(self, selector: str | None):
+        return self.targets.resolve(selector)
+
+    def _find_function(self, bv, identifier):
+        try:
+            addr = _parse_address(identifier)
+            fn = bv.get_function_at(addr)
+            if fn is not None:
+                return fn
+        except Exception:
+            pass
+
+        text = str(identifier)
+        for fn in list(bv.functions):
+            if fn.name == text:
+                return fn
+        for fn in list(bv.functions):
+            if fn.name.lower() == text.lower():
+                return fn
+        symbol = bv.get_symbol_by_raw_name(text)
+        if symbol is not None:
+            fn = bv.get_function_at(symbol.address)
+            if fn is not None:
+                return fn
+        raise RuntimeError(f"Function not found: {identifier}")
+
+    def _functions_containing(self, bv, address: int):
+        try:
+            return list(bv.get_functions_containing(address))
+        except Exception:
+            fn = bv.get_function_at(address)
+            return [fn] if fn is not None else []
+
+    def _function_text(self, bv, func, *, view: str = "hlil", ssa: bool = False) -> str:
+        il_name = {"hlil": "hlil", "mlil": "mlil", "llil": "llil"}.get(view, "hlil")
+        try:
+            il = getattr(func, il_name)
+            if ssa and hasattr(il, "ssa_form") and il.ssa_form is not None:
+                il = il.ssa_form
+            lines = []
+            for ins in il.instructions:
+                address = getattr(ins, "address", func.start)
+                lines.append(f"{int(address):08x}        {ins}")
+            if lines:
+                return "\n".join(lines)
+        except Exception:
+            pass
+        return str(func)
+
+    def _disasm_text(self, bv, func) -> str:
+        lines = []
+        for block in list(func.basic_blocks):
+            addr = block.start
+            while addr < block.end:
+                length = max(1, int(bv.get_instruction_length(addr)))
+                disasm = bv.get_disassembly(addr) or ""
+                raw = bv.read(addr, length)
+                hex_bytes = raw.hex(" ") if raw else ""
+                lines.append(f"{addr:08x}  {hex_bytes:<16} {disasm}")
+                addr += length
+        return "\n".join(lines)
+
+    def _list_locals(self, func) -> list[dict[str, Any]]:
+        variables = []
+        seen: set[tuple[str, int]] = set()
+        for collection, is_parameter in ((func.parameter_vars, True), (func.stack_layout, False)):
+            for var in list(collection):
+                marker = (str(var.name), int(var.storage))
+                if marker in seen:
+                    continue
+                seen.add(marker)
+                variables.append(
+                    {
+                        "name": var.name,
+                        "storage": int(var.storage),
+                        "type": str(var.type),
+                        "is_parameter": is_parameter,
+                    }
+                )
+        return variables
+
+    def _comment_map(self, bv, func) -> dict[str, str]:
+        comments: dict[str, str] = {}
+        for block in list(func.basic_blocks):
+            addr = block.start
+            while addr < block.end:
+                text = bv.get_comment_at(addr)
+                if text:
+                    comments[hex(addr)] = text
+                addr += max(1, int(bv.get_instruction_length(addr)))
+        return comments
+
+    def _xrefs_to_address(self, bv, address: int) -> dict[str, Any]:
+        code_refs = []
+        data_refs = []
+        for ref in list(bv.get_code_refs(address)):
+            code_refs.append(
+                {
+                    "function": ref.function.name if getattr(ref, "function", None) else None,
+                    "address": hex(ref.address),
+                }
+            )
+        for ref_addr in list(bv.get_data_refs(address)):
+            functions = self._functions_containing(bv, ref_addr)
+            data_refs.append(
+                {
+                    "function": functions[0].name if functions else None,
+                    "address": hex(ref_addr),
+                }
+            )
+        return {"address": hex(address), "code_refs": code_refs, "data_refs": data_refs}
+
+    def _list_functions(self, selector: str | None, offset: int, limit: int):
+        bv = self._resolve_view(selector)
+        items = [
+            {"name": fn.name, "address": hex(fn.start), "raw_name": getattr(fn, "raw_name", fn.name)}
+            for fn in list(bv.functions)
+        ]
+        return items[offset : offset + limit]
+
+    def _search_functions(self, selector: str | None, query: str, offset: int, limit: int):
+        bv = self._resolve_view(selector)
+        items = []
+        needle = query.lower()
+        for fn in list(bv.functions):
+            if needle in fn.name.lower():
+                items.append({"name": fn.name, "address": hex(fn.start)})
+        return items[offset : offset + limit]
+
+    def _decompile(self, selector: str | None, identifier):
+        bv = self._resolve_view(selector)
+        func = self._find_function(bv, identifier)
+        return {
+            "function": {"name": func.name, "address": hex(func.start)},
+            "text": self._function_text(bv, func, view="hlil"),
+        }
+
+    def _il(self, selector: str | None, identifier, view: str, ssa: bool):
+        bv = self._resolve_view(selector)
+        func = self._find_function(bv, identifier)
+        return {
+            "function": {"name": func.name, "address": hex(func.start)},
+            "view": view,
+            "ssa": ssa,
+            "text": self._function_text(bv, func, view=view, ssa=ssa),
+        }
+
+    def _disasm(self, selector: str | None, identifier):
+        bv = self._resolve_view(selector)
+        func = self._find_function(bv, identifier)
+        return {
+            "function": {"name": func.name, "address": hex(func.start)},
+            "text": self._disasm_text(bv, func),
+        }
+
+    def _xrefs(self, selector: str | None, identifier):
+        bv = self._resolve_view(selector)
+        try:
+            address = _parse_address(identifier)
+        except Exception:
+            address = self._find_function(bv, identifier).start
+        return self._xrefs_to_address(bv, address)
+
+    def _types(self, selector: str | None, *, query, offset: int, limit: int):
+        bv = self._resolve_view(selector)
+        items = []
+        needle = str(query).lower() if query else None
+        for name, type_obj in list(bv.types.items()):
+            entry = {
+                "name": str(name),
+                "kind": str(getattr(type_obj, "type_class", "unknown")),
+                "decl": str(type_obj),
+            }
+            if needle and needle not in entry["name"].lower() and needle not in entry["decl"].lower():
+                continue
+            items.append(entry)
+        return items[offset : offset + limit]
+
+    def _strings(self, selector: str | None, *, query, offset: int, limit: int):
+        bv = self._resolve_view(selector)
+        items = []
+        needle = str(query).lower() if query else None
+        for item in list(getattr(bv, "strings", [])):
+            value = str(getattr(item, "value", ""))
+            entry = {
+                "address": hex(int(getattr(item, "start", 0))),
+                "length": int(getattr(item, "length", 0)),
+                "type": str(getattr(item, "type", "")),
+                "value": value,
+            }
+            if needle and needle not in value.lower():
+                continue
+            items.append(entry)
+        return items[offset : offset + limit]
+
+    def _imports(self, selector: str | None):
+        bv = self._resolve_view(selector)
+        items = []
+        for sym in list(bv.get_symbols_of_type(bn.SymbolType.ImportedFunctionSymbol)):
+            items.append({"name": sym.name, "address": hex(sym.address)})
+        return items
+
+    def _data(self, selector: str | None, *, offset: int, limit: int):
+        bv = self._resolve_view(selector)
+        items = []
+        for addr in list(bv.data_vars):
+            symbol = bv.get_symbol_at(addr)
+            type_obj = bv.get_type_at(addr)
+            items.append(
+                {
+                    "address": hex(addr),
+                    "name": symbol.name if symbol else None,
+                    "type": str(type_obj) if type_obj is not None else None,
+                }
+            )
+        return items[offset : offset + limit]
+
+    def _bundle_function(self, selector: str | None, identifier, out_path: str | None):
+        bv = self._resolve_view(selector)
+        func = self._find_function(bv, identifier)
+        bundle = {
+            "target": self._target_info(selector),
+            "function": {
+                "name": func.name,
+                "address": hex(func.start),
+                "raw_name": getattr(func, "raw_name", func.name),
+                "type": str(func.type),
+            },
+            "decompile": self._function_text(bv, func, view="hlil"),
+            "il": {
+                "hlil": self._function_text(bv, func, view="hlil"),
+                "mlil": self._function_text(bv, func, view="mlil"),
+            },
+            "disassembly": self._disasm_text(bv, func),
+            "locals": self._list_locals(func),
+            "comments": self._comment_map(bv, func),
+            "xrefs": self._xrefs_to_address(bv, func.start),
+        }
+        artifact = _write_text_artifact(out_path, bundle)
+        if artifact:
+            bundle["artifact"] = artifact
+        return bundle
+
+    def _bundle_corpus(self, selector: str | None, kind: str, *, query, limit: int, out_path: str | None):
+        if kind == "functions":
+            payload = self._list_functions(selector, 0, limit)
+        elif kind == "types":
+            payload = self._types(selector, query=query, offset=0, limit=limit)
+        elif kind == "strings":
+            payload = self._strings(selector, query=query, offset=0, limit=limit)
+        else:
+            raise ValueError(f"Unsupported corpus kind: {kind}")
+
+        result = {"kind": kind, "items": payload}
+        artifact = _write_text_artifact(out_path, result)
+        if artifact:
+            result["artifact"] = artifact
+        return result
+
+    def _py_exec(self, selector: str | None, script: str, out_path: str | None):
+        bv = self._resolve_view(selector)
+        stdout = io.StringIO()
+        scope = {
+            "bn": bn,
+            "binaryninja": bn,
+            "bv": bv,
+            "result": None,
+        }
+        with contextlib.redirect_stdout(stdout):
+            exec(script, scope, scope)
+        result = {
+            "stdout": stdout.getvalue(),
+            "result": scope.get("result"),
+        }
+        artifact = _write_text_artifact(out_path, result)
+        if artifact:
+            result["artifact"] = artifact
+        return result
+
+    def _guess_type_affected_functions(self, bv, type_name: str, limit: int = 10):
+        matches = []
+        needle = type_name.lower()
+        for fn in list(bv.functions):
+            text = str(fn.type).lower()
+            if needle in text:
+                matches.append(fn)
+                if len(matches) >= limit:
+                    break
+        return matches
+
+    def _guess_affected_functions(self, bv, operations: list[dict[str, Any]]):
+        affected = []
+        seen = set()
+        for op in operations:
+            kind = op.get("op") or "rename_symbol"
+            functions = []
+            try:
+                if kind == "rename_symbol" and op.get("kind") != "data":
+                    functions = [self._find_function(bv, op["identifier"])]
+                elif kind in {"set_prototype", "local_rename", "local_retype"}:
+                    ident = op.get("identifier") or op.get("function")
+                    functions = [self._find_function(bv, ident)]
+                elif kind in {"set_comment", "delete_comment"}:
+                    if op.get("function"):
+                        functions = [self._find_function(bv, op["function"])]
+                    elif op.get("address"):
+                        functions = self._functions_containing(bv, _parse_address(op["address"]))
+                elif kind == "patch_bytes":
+                    functions = self._functions_containing(bv, _parse_address(op["address"]))
+                elif kind.startswith("struct_"):
+                    functions = self._guess_type_affected_functions(bv, str(op["struct_name"]))
+            except Exception:
+                functions = []
+
+            for fn in functions:
+                if fn is None:
+                    continue
+                marker = int(fn.start)
+                if marker not in seen:
+                    seen.add(marker)
+                    affected.append(fn)
+        return affected
+
+    def _capture_function_snapshots(self, bv, functions):
+        snapshots = {}
+        for fn in functions:
+            snapshots[int(fn.start)] = {
+                "name": fn.name,
+                "address": hex(fn.start),
+                "text": self._function_text(bv, fn, view="hlil"),
+            }
+        return snapshots
+
+    def _diff_snapshots(self, before: dict[int, Any], after: dict[int, Any]):
+        diffs = []
+        for address in sorted(set(before) | set(after)):
+            old = before.get(address, {"text": ""})
+            new = after.get(address, {"text": ""})
+            diff = "\n".join(
+                difflib.unified_diff(
+                    old["text"].splitlines(),
+                    new["text"].splitlines(),
+                    fromfile=f"before:{old.get('name', hex(address))}",
+                    tofile=f"after:{new.get('name', hex(address))}",
+                    lineterm="",
+                )
+            )
+            diffs.append(
+                {
+                    "address": hex(address),
+                    "before_name": old.get("name"),
+                    "after_name": new.get("name"),
+                    "diff": diff,
+                }
+            )
+        return diffs
+
+    def _find_variable(self, func, name: str):
+        for collection in (func.parameter_vars, func.stack_layout):
+            for var in list(collection):
+                if var.name == name:
+                    return var
+        raise RuntimeError(f"Variable not found: {name}")
+
+    def _apply_operation(self, bv, op: dict[str, Any]):
+        kind = op.get("op") or "rename_symbol"
+        if kind == "rename_symbol":
+            return self._op_rename_symbol(bv, op)
+        if kind == "set_comment":
+            return self._op_set_comment(bv, op)
+        if kind == "delete_comment":
+            return self._op_delete_comment(bv, op)
+        if kind == "set_prototype":
+            return self._op_set_prototype(bv, op)
+        if kind == "local_rename":
+            return self._op_local_rename(bv, op)
+        if kind == "local_retype":
+            return self._op_local_retype(bv, op)
+        if kind == "struct_field_set":
+            return self._op_struct_field_set(bv, op)
+        if kind == "struct_field_rename":
+            return self._op_struct_field_rename(bv, op)
+        if kind == "struct_field_delete":
+            return self._op_struct_field_delete(bv, op)
+        if kind == "struct_replace":
+            return self._op_struct_replace(bv, op)
+        if kind == "patch_bytes":
+            return self._op_patch_bytes(bv, op)
+        raise ValueError(f"Unsupported batch operation: {kind}")
+
+    def _mutation(self, selector: str | None, preview: bool, operations: list[dict[str, Any]]):
+        if not operations:
+            raise ValueError("Batch operation list is empty")
+
+        bv = self._resolve_view(selector)
+        affected = self._guess_affected_functions(bv, operations)
+        before = self._capture_function_snapshots(bv, affected)
+        state = bv.begin_undo_actions()
+        results = []
+        try:
+            for op in operations:
+                results.append(self._apply_operation(bv, op))
+            bv.update_analysis_and_wait()
+            after = self._capture_function_snapshots(bv, affected)
+            diffs = self._diff_snapshots(before, after)
+            if preview:
+                bv.revert_undo_actions(state)
+            else:
+                bv.commit_undo_actions(state)
+            return {
+                "preview": preview,
+                "results": results,
+                "affected_functions": diffs,
+            }
+        except Exception:
+            with contextlib.suppress(Exception):
+                bv.revert_undo_actions(state)
+            raise
+
+    def _op_rename_symbol(self, bv, op: dict[str, Any]):
+        kind = str(op.get("kind", "auto"))
+        identifier = op["identifier"]
+        new_name = str(op["new_name"])
+        if kind in {"auto", "function"}:
+            try:
+                fn = self._find_function(bv, identifier)
+            except Exception:
+                fn = None
+            if fn is not None:
+                fn.name = new_name
+                return {"op": "rename_symbol", "kind": "function", "address": hex(fn.start), "new_name": new_name}
+            if kind == "function":
+                raise RuntimeError(f"Function not found: {identifier}")
+        address = _parse_address(identifier)
+        bv.define_user_symbol(bn.Symbol(bn.SymbolType.DataSymbol, address, new_name))
+        return {"op": "rename_symbol", "kind": "data", "address": hex(address), "new_name": new_name}
+
+    def _op_set_comment(self, bv, op: dict[str, Any]):
+        comment = str(op["comment"])
+        if op.get("function"):
+            fn = self._find_function(bv, op["function"])
+            bv.set_comment_at(fn.start, comment)
+            return {"op": "set_comment", "address": hex(fn.start), "function": fn.name}
+        address = _parse_address(op["address"])
+        bv.set_comment_at(address, comment)
+        return {"op": "set_comment", "address": hex(address)}
+
+    def _op_delete_comment(self, bv, op: dict[str, Any]):
+        if op.get("function"):
+            fn = self._find_function(bv, op["function"])
+            bv.set_comment_at(fn.start, None)
+            return {"op": "delete_comment", "address": hex(fn.start), "function": fn.name}
+        address = _parse_address(op["address"])
+        bv.set_comment_at(address, None)
+        return {"op": "delete_comment", "address": hex(address)}
+
+    def _op_set_prototype(self, bv, op: dict[str, Any]):
+        fn = self._find_function(bv, op["identifier"])
+        fn.set_user_type(str(op["prototype"]))
+        return {"op": "set_prototype", "function": fn.name, "address": hex(fn.start)}
+
+    def _op_local_rename(self, bv, op: dict[str, Any]):
+        fn = self._find_function(bv, op["function"])
+        var = self._find_variable(fn, str(op["variable"]))
+        fn.create_user_var(var, var.type, str(op["new_name"]))
+        return {"op": "local_rename", "function": fn.name, "variable": str(op["variable"])}
+
+    def _op_local_retype(self, bv, op: dict[str, Any]):
+        fn = self._find_function(bv, op["function"])
+        var = self._find_variable(fn, str(op["variable"]))
+        fn.create_user_var(var, str(op["new_type"]), var.name)
+        return {"op": "local_retype", "function": fn.name, "variable": str(op["variable"])}
+
+    def _struct_builder(self, bv, struct_name: str):
+        type_obj = bv.get_type_by_name(struct_name)
+        if type_obj is None:
+            raise RuntimeError(f"Struct not found: {struct_name}")
+        return type_obj.mutable_copy()
+
+    def _commit_struct_builder(self, bv, struct_name: str, builder):
+        bv.define_user_type(struct_name, builder)
+
+    def _op_struct_field_set(self, bv, op: dict[str, Any]):
+        struct_name = str(op["struct_name"])
+        builder = self._struct_builder(bv, struct_name)
+        field_type, _ = bv.parse_type_string(str(op["field_type"]))
+        offset = _parse_address(op["offset"])
+        overwrite = bool(op.get("overwrite_existing", True))
+        builder.add_member_at_offset(str(op["field_name"]), field_type, offset, overwrite)
+        try:
+            builder.width = max(int(builder.width), int(offset) + int(field_type.width))
+        except Exception:
+            pass
+        self._commit_struct_builder(bv, struct_name, builder)
+        return {"op": "struct_field_set", "struct_name": struct_name, "offset": hex(offset)}
+
+    def _op_struct_field_rename(self, bv, op: dict[str, Any]):
+        struct_name = str(op["struct_name"])
+        builder = self._struct_builder(bv, struct_name)
+        index = builder.index_by_name(str(op["old_name"]))
+        if index is None:
+            raise RuntimeError(f"Field not found: {op['old_name']}")
+        member = builder[str(op["old_name"])]
+        if member is None:
+            raise RuntimeError(f"Field not found: {op['old_name']}")
+        builder.replace(index, member.type, str(op["new_name"]), True)
+        self._commit_struct_builder(bv, struct_name, builder)
+        return {"op": "struct_field_rename", "struct_name": struct_name}
+
+    def _op_struct_field_delete(self, bv, op: dict[str, Any]):
+        struct_name = str(op["struct_name"])
+        builder = self._struct_builder(bv, struct_name)
+        index = builder.index_by_name(str(op["field_name"]))
+        if index is None:
+            raise RuntimeError(f"Field not found: {op['field_name']}")
+        builder.remove(index)
+        self._commit_struct_builder(bv, struct_name, builder)
+        return {"op": "struct_field_delete", "struct_name": struct_name}
+
+    def _op_struct_replace(self, bv, op: dict[str, Any]):
+        bv.define_user_type(None, str(op["declaration"]))
+        return {"op": "struct_replace"}
+
+    def _op_patch_bytes(self, bv, op: dict[str, Any]):
+        address = _parse_address(op["address"])
+        data = _clean_bytes(str(op["data"]))
+        original = bv.read(address, len(data))
+        written = bv.write(address, data)
+        if written != len(data):
+            raise RuntimeError(f"Patched {written} bytes but expected {len(data)}")
+        return {
+            "op": "patch_bytes",
+            "address": hex(address),
+            "original": original.hex() if original else None,
+            "patched": data.hex(),
+        }
+
+
+_bridge: BinaryNinjaBridge | None = None
+
+
+def _start_bridge_command(_):  # pragma: no cover - GUI runtime
+    start_bridge()
+
+
+def start_bridge():  # pragma: no cover - GUI runtime
+    global _bridge
+    if ui is None:
+        bn.log_warn("BN Agent Bridge requires the Binary Ninja GUI")
+        return
+    if _bridge is not None:
+        return
+    _bridge = BinaryNinjaBridge()
+    _bridge.start()
+
+
+def _stop_bridge():  # pragma: no cover - GUI runtime
+    global _bridge
+    if _bridge is not None:
+        _bridge.stop()
+        _bridge = None
+
+
+atexit.register(_stop_bridge)
+
+PluginCommand.register(
+    "BN Agent Bridge\\Restart Bridge",
+    "Restart the bn CLI socket bridge",
+    _start_bridge_command,
+)
