@@ -99,8 +99,17 @@ def _call(
     require_target: bool,
     allow_implicit_target: bool = False,
     text_renderer: Callable[[Any], str] | None = None,
+    page_limit: int | None = None,
+    page_offset: int = 0,
+    page_label: str | None = None,
     stem: str,
 ) -> int:
+    request_params = dict(params or {})
+    effective_page_limit = None
+    if page_limit is not None and page_limit >= 0:
+        effective_page_limit = page_limit
+        request_params["limit"] = page_limit + 1
+
     target = _resolve_target(
         args,
         require_target=require_target,
@@ -108,11 +117,19 @@ def _call(
     )
     response = send_request(
         op,
-        params=params,
+        params=request_params,
         target=target,
         instance_pid=getattr(args, "instance", None),
     )
     result = response["result"]
+    if effective_page_limit is not None and isinstance(result, list) and len(result) > effective_page_limit:
+        result = result[:effective_page_limit]
+        label = page_label or op
+        next_offset = page_offset + effective_page_limit
+        print(
+            f"warning: {label} output truncated to {effective_page_limit} items; rerun with --offset {next_offset} or a larger --limit",
+            file=sys.stderr,
+        )
     if text_renderer is not None and args.format in {"text", "md"}:
         result = text_renderer(result)
     _render_result(
@@ -642,6 +659,9 @@ def _function_list(args: argparse.Namespace) -> int:
         {"offset": args.offset, "limit": args.limit},
         require_target=True,
         text_renderer=_render_name_address_list_text,
+        page_limit=args.limit,
+        page_offset=args.offset,
+        page_label="function list",
         stem="functions",
     )
 
@@ -653,6 +673,9 @@ def _function_search(args: argparse.Namespace) -> int:
         {"query": args.query, "offset": args.offset, "limit": args.limit},
         require_target=True,
         text_renderer=_render_name_address_list_text,
+        page_limit=args.limit,
+        page_offset=args.offset,
+        page_label="function search",
         stem="function-search",
     )
 
@@ -732,6 +755,9 @@ def _types(args: argparse.Namespace) -> int:
         {"query": args.query, "offset": args.offset, "limit": args.limit},
         require_target=True,
         text_renderer=_render_type_list_text,
+        page_limit=args.limit,
+        page_offset=args.offset,
+        page_label="types",
         stem="types",
     )
 
@@ -783,6 +809,9 @@ def _strings(args: argparse.Namespace) -> int:
         {"query": args.query, "offset": args.offset, "limit": args.limit},
         require_target=True,
         text_renderer=_render_strings_text,
+        page_limit=args.limit,
+        page_offset=args.offset,
+        page_label="strings",
         stem="strings",
     )
 
@@ -805,6 +834,9 @@ def _data(args: argparse.Namespace) -> int:
         {"offset": args.offset, "limit": args.limit},
         require_target=True,
         text_renderer=_render_data_text,
+        page_limit=args.limit,
+        page_offset=args.offset,
+        page_label="data",
         stem="data",
     )
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import bn.cli
@@ -21,6 +22,32 @@ def test_function_list_defaults_to_active_target(monkeypatch, capsys):
     assert captured["op"] == "list_functions"
     assert captured["target"] == "active"
     assert "sub_401000" in capsys.readouterr().out
+
+
+def test_function_list_warns_on_truncation(monkeypatch, capsys):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, instance_pid=None, timeout=30.0):
+        captured["op"] = op
+        captured["params"] = params
+        captured["target"] = target
+        assert params["limit"] == 101
+        return {
+            "ok": True,
+            "result": [{"name": f"sub_{index:06x}", "address": hex(index)} for index in range(101)],
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["function", "list"])
+
+    assert rc == 0
+    assert captured["op"] == "list_functions"
+    stdout, stderr = capsys.readouterr()
+    payload = json.loads(stdout)
+    assert len(payload) == 100
+    assert "warning: function list output truncated to 100 items" in stderr
+    assert "--offset 100" in stderr
 
 
 def test_function_info_uses_active_target_and_text_renderer(monkeypatch, capsys):
