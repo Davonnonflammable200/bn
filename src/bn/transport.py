@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .paths import registry_dir
+from .paths import bridge_registry_path, registry_dir
 
 
 class BridgeError(RuntimeError):
@@ -41,10 +41,9 @@ class BridgeInstance:
         return f"{self.pid}:{self.plugin_version}"
 
 
-def _purge_stale_instance(registry_path: Path, socket_path: Path) -> None:
-    for path in (registry_path, socket_path):
-        with contextlib.suppress(OSError):
-            path.unlink()
+def _purge_stale_registry(registry_path: Path) -> None:
+    with contextlib.suppress(OSError):
+        registry_path.unlink()
 
 def _socket_is_live(socket_path: Path, timeout: float = 0.2) -> bool:
     try:
@@ -71,12 +70,12 @@ def _load_instance(path: Path) -> BridgeInstance | None:
 
     if not socket_path.exists():
         _debug(f"socket missing for registry {path}: {socket_path}")
-        _purge_stale_instance(path, socket_path)
+        _purge_stale_registry(path)
         return None
 
     if not _socket_is_live(socket_path):
         _debug(f"socket {socket_path} not live for registry {path}")
-        _purge_stale_instance(path, socket_path)
+        _purge_stale_registry(path)
         return None
 
     _debug(f"accepted registry {path} for pid {pid}")
@@ -92,21 +91,34 @@ def _load_instance(path: Path) -> BridgeInstance | None:
 
 
 def list_instances() -> list[BridgeInstance]:
-    root = registry_dir()
+    fixed_registry = bridge_registry_path()
+    legacy_root = registry_dir()
     _debug(
         "list_instances "
         f"executable={sys.executable} "
         f"prefix={sys.prefix} "
         f"base_prefix={sys.base_prefix} "
         f"cwd={Path.cwd()} "
-        f"registry_dir={root}"
+        f"fixed_registry={fixed_registry} "
+        f"legacy_registry_dir={legacy_root}"
     )
-    if not root.exists():
-        _debug("registry dir does not exist")
+
+    registry_paths: list[Path] = []
+    if fixed_registry.exists():
+        registry_paths.append(fixed_registry)
+    elif not legacy_root.exists():
+        _debug("no bridge registry paths exist")
         return []
 
+    if legacy_root.exists():
+        registry_paths.extend(sorted(legacy_root.glob("*.json")))
+
     instances: list[BridgeInstance] = []
-    for path in sorted(root.glob("*.json")):
+    seen: set[Path] = set()
+    for path in registry_paths:
+        if path in seen:
+            continue
+        seen.add(path)
         instance = _load_instance(path)
         if instance is not None:
             instances.append(instance)

@@ -35,6 +35,10 @@ def registry_dir() -> Path:
     return cache_home() / "instances"
 
 
+def bridge_registry_path() -> Path:
+    return cache_home() / f"{PLUGIN_NAME}.json"
+
+
 def spill_root() -> Path:
     return cache_home() / "spills"
 

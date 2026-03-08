@@ -22,6 +22,7 @@ uv run bn decompile --target active sub_401000
 ```
 
 Large results automatically spill to a cache artifact and print a compact JSON envelope with the artifact path.
+When exactly one BinaryView is open, `--target active` also falls back to that sole target even if Binary Ninja's UI focus is currently on a non-BinaryView pane.
 
 When `bn target list` shows a unique `selector`, prefer that over the full `target_id`. In the common one-instance case this is usually just the BinaryView basename, for example `--target SnailMail_unwrapped.exe.bndb`. The full `PID:VIEW:SESSION` target id remains available as the unambiguous fallback.
 

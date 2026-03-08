@@ -51,11 +51,25 @@ def _spill_dir() -> Path:
 
 
 def _registry_path() -> Path:
-    return _registry_dir() / f"{os.getpid()}.json"
+    return _cache_home() / f"{PLUGIN_NAME}.json"
 
 
 def _socket_path() -> Path:
-    return _cache_home() / f"{PLUGIN_NAME}-{os.getpid()}.sock"
+    return _cache_home() / f"{PLUGIN_NAME}.sock"
+
+
+def _cleanup_legacy_bridge_files() -> None:
+    legacy_dir = _registry_dir()
+    if legacy_dir.exists():
+        for path in legacy_dir.glob("*.json"):
+            with contextlib.suppress(OSError):
+                path.unlink()
+        with contextlib.suppress(OSError):
+            legacy_dir.rmdir()
+
+    for path in _cache_home().glob(f"{PLUGIN_NAME}-*.sock"):
+        with contextlib.suppress(OSError):
+            path.unlink()
 
 
 def _json_response(*, ok: bool, result: Any = None, error: str | None = None) -> dict[str, Any]:
@@ -115,17 +129,26 @@ def _write_text_artifact(path_text: str | None, payload: Any) -> dict[str, Any] 
 def _active_binary_view():
     if ui is None:
         return None
-    try:
-        context = ui.UIContext.activeContext()
-        if context is None:
-            return None
-        frame = context.getCurrentViewFrame()
+
+    def view_from_frame(frame):
         if frame is None:
             return None
         if hasattr(frame, "getCurrentBinaryView"):
             return frame.getCurrentBinaryView()
         if hasattr(frame, "getBinaryView"):
             return frame.getBinaryView()
+        return None
+
+    try:
+        context = ui.UIContext.activeContext()
+        if context is not None:
+            view = view_from_frame(context.getCurrentViewFrame())
+            if view is not None:
+                return view
+
+        contexts = list(ui.UIContext.allContexts())
+        if len(contexts) == 1:
+            return view_from_frame(contexts[0].getCurrentViewFrame())
     except Exception:
         return None
     return None
@@ -246,9 +269,21 @@ class TargetManager:
                 return True
         return False
 
+    def _default_view(self):
+        active = _active_binary_view()
+        if active is not None:
+            return active
+
+        with self._lock:
+            live_views = [record.ref() for record in self._records.values()]
+        live_views = [view for view in live_views if view is not None]
+        if len(live_views) == 1:
+            return live_views[0]
+        return None
+
     def refresh(self) -> list[dict[str, Any]]:
         views = _collect_open_views()
-        active = _active_binary_view()
+        focused = _active_binary_view()
 
         with self._lock:
             alive: dict[str, TargetRecord] = {}
@@ -279,6 +314,9 @@ class TargetManager:
                 )
 
             self._records = alive
+            active = focused
+            if active is None and len(self._records) == 1:
+                active = next(iter(self._records.values())).ref()
             basename_counts: dict[str, int] = {}
             for record in self._records.values():
                 if record.basename:
@@ -311,9 +349,9 @@ class TargetManager:
 
         selector_candidates = self._selector_candidates(selector)
         if selector in (None, "", "active") or "active" in selector_candidates:
-            active = _active_binary_view()
+            active = self._default_view()
             if active is None:
-                raise RuntimeError("No active BinaryView is selected")
+                raise RuntimeError("No active BinaryView is selected and multiple targets are open")
             return active
 
         with self._lock:
@@ -358,7 +396,7 @@ class BinaryNinjaBridge:
         self._thread: threading.Thread | None = None
 
     def start(self):  # pragma: no cover - requires GUI runtime
-        _registry_dir().mkdir(parents=True, exist_ok=True)
+        _cleanup_legacy_bridge_files()
         self.socket_path.parent.mkdir(parents=True, exist_ok=True)
         if self.socket_path.exists():
             self.socket_path.unlink()

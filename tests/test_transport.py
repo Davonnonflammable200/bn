@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from bn.paths import bridge_registry_path
 from bn.transport import choose_instance, list_instances, send_request
 
 
@@ -132,7 +133,7 @@ def test_list_instances_prunes_stale_registry_and_socket(tmp_path, monkeypatch):
 
     assert instances == []
     assert not registry_path.exists()
-    assert not stale_socket_path.exists()
+    assert stale_socket_path.exists()
 
 
 def test_send_request_wraps_socket_errors(tmp_path, monkeypatch):
@@ -182,6 +183,39 @@ def test_list_instances_trusts_live_socket_even_with_stale_pid(tmp_path, monkeyp
         assert len(instances) == 1
         assert instances[0].pid == 111
         assert registry_path.exists()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_list_instances_reads_fixed_registry_path(tmp_path, monkeypatch):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    pid = os.getpid()
+    socket_path = Path("/tmp") / f"bn-fixed-{pid}-{uuid.uuid4().hex[:8]}.sock"
+    server = _Server(str(socket_path), _Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    registry_path = bridge_registry_path()
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    registry_path.write_text(
+        json.dumps(
+            {
+                "pid": pid,
+                "socket_path": str(socket_path),
+                "plugin_name": "bn_agent_bridge",
+                "plugin_version": "0.1.0",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    try:
+        instances = list_instances()
+
+        assert len(instances) == 1
+        assert instances[0].pid == pid
+        assert instances[0].registry_path == registry_path
     finally:
         server.shutdown()
         server.server_close()
