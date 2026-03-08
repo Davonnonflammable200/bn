@@ -91,7 +91,7 @@ def choose_instance(
         return instances[0]
 
     raise BridgeError(
-        "Multiple Binary Ninja bridge instances are running; pass --instance or use a full target id"
+        "Multiple Binary Ninja bridge instances are running; pass --instance or prefix the target selector with PID:"
     )
 
 

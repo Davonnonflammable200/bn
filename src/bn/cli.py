@@ -43,7 +43,7 @@ def _target_option(
     default: str | None = None,
 ) -> None:
     kwargs: dict[str, Any] = {
-        "help": "Target id from `bn target list` or the literal `active`",
+        "help": "Target selector from `bn target list` (`selector`, `target_id`, basename, filename, or view id) or `active`",
         "required": required,
     }
     if default is not None:

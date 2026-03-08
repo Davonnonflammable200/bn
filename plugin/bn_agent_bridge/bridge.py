@@ -215,6 +215,37 @@ class TargetManager:
                 continue
         return type(bv).__name__
 
+    def _selector_candidates(self, selector: str | None) -> list[str]:
+        if selector is None:
+            return []
+        text = str(selector).strip()
+        if not text:
+            return [""]
+
+        candidates = [text]
+        prefix, sep, tail = text.partition(":")
+        if sep and prefix.isdigit() and int(prefix) == os.getpid():
+            candidates.append(tail)
+        return candidates
+
+    def _preferred_selector(self, record: TargetRecord, basename_counts: dict[str, int]) -> str:
+        if record.basename and basename_counts.get(record.basename, 0) == 1:
+            return record.basename
+        return record.target_id()
+
+    def _matches_record(self, record: TargetRecord, selector: str | None) -> bool:
+        for candidate in self._selector_candidates(selector):
+            if candidate in ("", "active"):
+                continue
+            if candidate in (
+                record.target_id(),
+                record.view_id,
+                record.filename,
+                record.basename,
+            ):
+                return True
+        return False
+
     def refresh(self) -> list[dict[str, Any]]:
         views = _collect_open_views()
         active = _active_binary_view()
@@ -248,6 +279,10 @@ class TargetManager:
                 )
 
             self._records = alive
+            basename_counts: dict[str, int] = {}
+            for record in self._records.values():
+                if record.basename:
+                    basename_counts[record.basename] = basename_counts.get(record.basename, 0) + 1
 
             result = []
             for view_id in sorted(self._records, key=lambda item: int(item)):
@@ -262,6 +297,7 @@ class TargetManager:
                         "session_id": record.session_id,
                         "filename": record.filename,
                         "basename": record.basename,
+                        "selector": self._preferred_selector(record, basename_counts),
                         "view_name": record.view_name,
                         "active": bool(view is active),
                     }
@@ -273,21 +309,16 @@ class TargetManager:
         if not targets:
             raise RuntimeError("No BinaryView targets are open in the GUI")
 
-        if selector in (None, "", "active"):
+        selector_candidates = self._selector_candidates(selector)
+        if selector in (None, "", "active") or "active" in selector_candidates:
             active = _active_binary_view()
             if active is None:
                 raise RuntimeError("No active BinaryView is selected")
             return active
 
-        text = str(selector).strip()
         with self._lock:
             for record in self._records.values():
-                if text in (
-                    record.target_id(),
-                    record.view_id,
-                    record.filename,
-                    record.basename,
-                ):
+                if self._matches_record(record, selector):
                     view = record.ref()
                     if view is not None:
                         return view
@@ -478,11 +509,10 @@ class BinaryNinjaBridge:
             if item["active"] and selector in (None, "", "active"):
                 record = item
                 break
-            if selector and selector in (
-                item["target_id"],
-                item["view_id"],
-                item["filename"],
-                item["basename"],
+            if selector and any(
+                self.targets._matches_record(target_record, selector)
+                for target_record in self.targets._records.values()
+                if target_record.target_id() == item["target_id"]
             ):
                 record = item
                 break

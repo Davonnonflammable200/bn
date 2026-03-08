@@ -62,3 +62,33 @@ def test_send_request_uses_registry_and_socket(tmp_path, monkeypatch):
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_choose_instance_accepts_pid_prefixed_human_selector(tmp_path, monkeypatch):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    registry_dir = tmp_path / "instances"
+    registry_dir.mkdir(parents=True)
+
+    socket_path = Path("/tmp") / f"bn-test-{os.getpid()}-{uuid.uuid4().hex[:8]}.sock"
+    server = _Server(str(socket_path), _Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    (registry_dir / "456.json").write_text(
+        json.dumps(
+            {
+                "pid": 456,
+                "socket_path": str(socket_path),
+                "plugin_name": "bn_agent_bridge",
+                "plugin_version": "0.1.0",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    try:
+        instance = choose_instance(target="456:SnailMail_unwrapped.exe.bndb")
+        assert instance.pid == 456
+    finally:
+        server.shutdown()
+        server.server_close()
