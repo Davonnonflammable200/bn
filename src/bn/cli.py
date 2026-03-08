@@ -294,7 +294,11 @@ def _bundle_corpus(args: argparse.Namespace) -> int:
 
 
 def _py_exec(args: argparse.Namespace) -> int:
-    if args.script:
+    if getattr(args, "code", None) is not None:
+        script = args.code
+    elif args.script:
+        if not args.script.exists():
+            raise BridgeError(f"Script file not found: {args.script}. Use --code for inline Python.")
         script = args.script.read_text(encoding="utf-8")
     else:
         script = sys.stdin.read()
@@ -602,7 +606,8 @@ def build_parser() -> argparse.ArgumentParser:
     _common_io_options(py_exec)
     _target_option(py_exec, required=True)
     source = py_exec.add_mutually_exclusive_group(required=True)
-    source.add_argument("--script", type=Path)
+    source.add_argument("--script", type=Path, help="Read Python code from a file")
+    source.add_argument("--code", help="Inline Python code")
     source.add_argument("--stdin", action="store_true")
     py_exec.set_defaults(handler=_py_exec)
 

@@ -65,3 +65,29 @@ def test_plugin_install_copy_mode(tmp_path):
     )
     assert rc == 0
     assert (destination / "bridge.py").exists()
+
+
+def test_py_exec_accepts_inline_code(monkeypatch):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, instance_pid=None, timeout=30.0):
+        captured["op"] = op
+        captured["params"] = params
+        captured["target"] = target
+        return {"ok": True, "result": {"stdout": "", "result": None}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["py", "exec", "--target", "active", "--code", "print('hi')"])
+
+    assert rc == 0
+    assert captured["op"] == "py_exec"
+    assert captured["target"] == "active"
+    assert captured["params"]["script"] == "print('hi')"
+
+
+def test_py_exec_missing_script_mentions_code(capsys):
+    rc = bn.cli.main(["py", "exec", "--target", "active", "--script", "missing.py"])
+
+    assert rc == 2
+    assert "Use --code for inline Python" in capsys.readouterr().err

@@ -125,6 +125,8 @@ bn bundle function end_track_attachment_follow_state --target active --out /tmp/
 Run Python inside the Binary Ninja process:
 
 ```bash
+bn py exec --target active --code "print(hex(bv.entry_point)); result = {'functions': len(list(bv.functions))}"
+
 bn py exec --target active --stdin <<'PY'
 print(hex(bv.entry_point))
 result = {"functions": len(list(bv.functions))}
@@ -157,6 +159,8 @@ bn patch bytes --target active 0x401000 "90 90" --preview
 ```
 
 Preview mode applies the change, refreshes analysis, captures affected decompile diffs, and then reverts the mutation.
+
+For struct mutations, preview results also include `affected_types` with before/after layouts and a unified diff. If a field edit is already identical, the result is marked with `changed: false` and a `No effective change detected` message.
 
 ## Batch Manifests
 

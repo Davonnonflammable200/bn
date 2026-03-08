@@ -865,6 +865,98 @@ class BinaryNinjaBridge:
                     affected.append(fn)
         return affected
 
+    def _affected_type_names(self, operations: list[dict[str, Any]]) -> list[str]:
+        names: list[str] = []
+        seen: set[str] = set()
+        for op in operations:
+            type_name = op.get("struct_name")
+            if not type_name:
+                continue
+            text = str(type_name)
+            if text not in seen:
+                seen.add(text)
+                names.append(text)
+        return names
+
+    def _render_type_layout(self, type_obj) -> str:
+        header = str(type_obj)
+        try:
+            width = int(getattr(type_obj, "width", 0))
+            header = f"{header} // size=0x{width:x}"
+        except Exception:
+            pass
+
+        members = getattr(type_obj, "members", None)
+        if members is None:
+            return header
+
+        lines = [header]
+        for member in list(members):
+            try:
+                offset = int(getattr(member, "offset", 0))
+            except Exception:
+                offset = 0
+            name = str(getattr(member, "name", "<anonymous>"))
+            member_type = str(getattr(member, "type", "<unknown>"))
+            lines.append(f"0x{offset:04x}: {member_type} {name}")
+        return "\n".join(lines)
+
+    def _capture_type_snapshots(self, bv, operations: list[dict[str, Any]]):
+        snapshots: dict[str, dict[str, Any]] = {}
+        for type_name in self._affected_type_names(operations):
+            type_obj = bv.get_type_by_name(type_name)
+            if type_obj is None:
+                continue
+            snapshots[type_name] = {
+                "type_name": type_name,
+                "decl": str(type_obj),
+                "layout": self._render_type_layout(type_obj),
+            }
+        return snapshots
+
+    def _diff_type_snapshots(self, before: dict[str, Any], after: dict[str, Any]):
+        diffs = []
+        for type_name in sorted(set(before) | set(after)):
+            old = before.get(type_name, {"decl": "", "layout": ""})
+            new = after.get(type_name, {"decl": "", "layout": ""})
+            layout_diff = "\n".join(
+                difflib.unified_diff(
+                    old["layout"].splitlines(),
+                    new["layout"].splitlines(),
+                    fromfile=f"before:{type_name}",
+                    tofile=f"after:{type_name}",
+                    lineterm="",
+                )
+            )
+            changed = old["decl"] != new["decl"] or old["layout"] != new["layout"]
+            entry = {
+                "type_name": type_name,
+                "before_decl": old["decl"],
+                "after_decl": new["decl"],
+                "before_layout": old["layout"],
+                "after_layout": new["layout"],
+                "layout_diff": layout_diff,
+                "changed": changed,
+            }
+            if not changed:
+                entry["message"] = "No effective change detected"
+            diffs.append(entry)
+        return diffs
+
+    def _annotate_operation_results(self, results: list[dict[str, Any]], type_diffs: list[dict[str, Any]]):
+        type_changes = {item["type_name"]: item for item in type_diffs}
+        annotated = []
+        for result in results:
+            item = dict(result)
+            type_name = item.get("struct_name")
+            if type_name and type_name in type_changes:
+                change = type_changes[type_name]
+                item["changed"] = bool(change["changed"])
+                if not change["changed"]:
+                    item["message"] = change["message"]
+            annotated.append(item)
+        return annotated
+
     def _capture_function_snapshots(self, bv, functions):
         snapshots = {}
         for fn in functions:
@@ -939,6 +1031,7 @@ class BinaryNinjaBridge:
         bv = self._resolve_view(selector)
         affected = self._guess_affected_functions(bv, operations)
         before = self._capture_function_snapshots(bv, affected)
+        type_before = self._capture_type_snapshots(bv, operations)
         state = bv.begin_undo_actions()
         results = []
         try:
@@ -946,15 +1039,18 @@ class BinaryNinjaBridge:
                 results.append(self._apply_operation(bv, op))
             bv.update_analysis_and_wait()
             after = self._capture_function_snapshots(bv, affected)
+            type_after = self._capture_type_snapshots(bv, operations)
             diffs = self._diff_snapshots(before, after)
+            type_diffs = self._diff_type_snapshots(type_before, type_after)
             if preview:
                 bv.revert_undo_actions(state)
             else:
                 bv.commit_undo_actions(state)
             return {
                 "preview": preview,
-                "results": results,
+                "results": self._annotate_operation_results(results, type_diffs),
                 "affected_functions": diffs,
+                "affected_types": type_diffs,
             }
         except Exception:
             with contextlib.suppress(Exception):
@@ -1036,7 +1132,13 @@ class BinaryNinjaBridge:
         except Exception:
             pass
         self._commit_struct_builder(bv, struct_name, builder)
-        return {"op": "struct_field_set", "struct_name": struct_name, "offset": hex(offset)}
+        return {
+            "op": "struct_field_set",
+            "struct_name": struct_name,
+            "offset": hex(offset),
+            "field_name": str(op["field_name"]),
+            "field_type": str(field_type),
+        }
 
     def _op_struct_field_rename(self, bv, op: dict[str, Any]):
         struct_name = str(op["struct_name"])
@@ -1049,7 +1151,12 @@ class BinaryNinjaBridge:
             raise RuntimeError(f"Field not found: {op['old_name']}")
         builder.replace(index, member.type, str(op["new_name"]), True)
         self._commit_struct_builder(bv, struct_name, builder)
-        return {"op": "struct_field_rename", "struct_name": struct_name}
+        return {
+            "op": "struct_field_rename",
+            "struct_name": struct_name,
+            "old_name": str(op["old_name"]),
+            "new_name": str(op["new_name"]),
+        }
 
     def _op_struct_field_delete(self, bv, op: dict[str, Any]):
         struct_name = str(op["struct_name"])
@@ -1059,7 +1166,11 @@ class BinaryNinjaBridge:
             raise RuntimeError(f"Field not found: {op['field_name']}")
         builder.remove(index)
         self._commit_struct_builder(bv, struct_name, builder)
-        return {"op": "struct_field_delete", "struct_name": struct_name}
+        return {
+            "op": "struct_field_delete",
+            "struct_name": struct_name,
+            "field_name": str(op["field_name"]),
+        }
 
     def _op_struct_replace(self, bv, op: dict[str, Any]):
         bv.define_user_type(None, str(op["declaration"]))
