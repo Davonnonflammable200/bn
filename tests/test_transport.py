@@ -15,7 +15,10 @@ from bn.transport import choose_instance, list_instances, send_request
 
 class _Handler(socketserver.StreamRequestHandler):
     def handle(self):
-        payload = json.loads(self.rfile.readline().decode("utf-8"))
+        raw = self.rfile.readline()
+        if not raw:
+            return
+        payload = json.loads(raw.decode("utf-8"))
         response = {
             "ok": True,
             "result": {
@@ -148,3 +151,37 @@ def test_send_request_wraps_socket_errors(tmp_path, monkeypatch):
 
     with pytest.raises(BridgeError, match="Failed to contact Binary Ninja bridge pid 999"):
         send_request("doctor")
+
+
+def test_list_instances_trusts_live_socket_even_with_stale_pid(tmp_path, monkeypatch):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    registry_dir = tmp_path / "instances"
+    registry_dir.mkdir(parents=True)
+
+    socket_path = Path("/tmp") / f"bn-live-{os.getpid()}-{uuid.uuid4().hex[:8]}.sock"
+    server = _Server(str(socket_path), _Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    registry_path = registry_dir / "111.json"
+    registry_path.write_text(
+        json.dumps(
+            {
+                "pid": 111,
+                "socket_path": str(socket_path),
+                "plugin_name": "bn_agent_bridge",
+                "plugin_version": "0.1.0",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    try:
+        instances = list_instances()
+
+        assert len(instances) == 1
+        assert instances[0].pid == 111
+        assert registry_path.exists()
+    finally:
+        server.shutdown()
+        server.server_close()
