@@ -1,15 +1,20 @@
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import tiktoken
+
 from .paths import spill_root
 
 
 DEFAULT_SPILL_THRESHOLD = 64 * 1024
+# `tiktoken` does not currently resolve the dotted `gpt-5.4` alias directly.
+GPT_5_4_TOKENIZER = "o200k_base"
 
 
 def _json_default(value: Any) -> Any:
@@ -52,6 +57,35 @@ def _spill_path(stem: str, suffix: str) -> Path:
     return directory / f"{stem}-{now.strftime('%H%M%S')}{suffix}"
 
 
+@functools.cache
+def _token_encoding() -> tiktoken.Encoding:
+    return tiktoken.get_encoding(GPT_5_4_TOKENIZER)
+
+
+def _artifact_envelope(
+    *,
+    artifact_path: Path,
+    fmt: str,
+    rendered: str,
+    encoded: bytes,
+    value: Any,
+) -> str:
+    return json.dumps(
+        {
+            "ok": True,
+            "artifact_path": str(artifact_path),
+            "format": fmt,
+            "bytes": len(encoded),
+            "tokens": len(_token_encoding().encode(rendered)),
+            "tokenizer": GPT_5_4_TOKENIZER,
+            "sha256": hashlib.sha256(encoded).hexdigest(),
+            "summary": _summary(value),
+        },
+        indent=2,
+        sort_keys=True,
+    ) + "\n"
+
+
 def write_output(
     value: Any,
     *,
@@ -66,18 +100,13 @@ def write_output(
     if out_path is not None:
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_bytes(encoded)
-        return json.dumps(
-            {
-                "ok": True,
-                "artifact_path": str(out_path),
-                "format": fmt,
-                "bytes": len(encoded),
-                "sha256": hashlib.sha256(encoded).hexdigest(),
-                "summary": _summary(value),
-            },
-            indent=2,
-            sort_keys=True,
-        ) + "\n"
+        return _artifact_envelope(
+            artifact_path=out_path,
+            fmt=fmt,
+            rendered=rendered,
+            encoded=encoded,
+            value=value,
+        )
 
     if len(encoded) <= spill_threshold:
         return rendered
@@ -85,15 +114,10 @@ def write_output(
     suffix = ".ndjson" if fmt == "ndjson" else ".txt" if fmt == "text" else ".json"
     spill_path = _spill_path(stem, suffix)
     spill_path.write_bytes(encoded)
-    return json.dumps(
-        {
-            "ok": True,
-            "artifact_path": str(spill_path),
-            "format": fmt,
-            "bytes": len(encoded),
-            "sha256": hashlib.sha256(encoded).hexdigest(),
-            "summary": _summary(value),
-        },
-        indent=2,
-        sort_keys=True,
-    ) + "\n"
+    return _artifact_envelope(
+        artifact_path=spill_path,
+        fmt=fmt,
+        rendered=rendered,
+        encoded=encoded,
+        value=value,
+    )

@@ -91,7 +91,7 @@ bn function list --format ndjson
 bn decompile sample_track_floor_height_at_position --out /tmp/floor.json
 ```
 
-If `--out` is set, the command writes the rendered result to that path and prints a compact JSON envelope with the artifact path, size, hash, and summary.
+If `--out` is set, the command writes the rendered result to that path and prints a compact JSON envelope with the artifact path, byte size, token count, tokenizer, hash, and summary.
 
 The only exception is `bn bundle function`, which writes the bundle artifact from inside the bridge and prints the envelope back to the CLI.
 
