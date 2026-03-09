@@ -631,7 +631,7 @@ def test_doctor_reports_stale_loaded_plugin(monkeypatch, tmp_path, capsys):
 
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload["cli_version"] == "0.5.1"
+    assert payload["cli_version"] == "0.6.0"
     assert payload["plugin_install_build_id"]
     assert payload["instances"][0]["stale_plugin_version"] is True
     assert payload["instances"][0]["stale_plugin_code"] is True
