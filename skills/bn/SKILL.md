@@ -61,7 +61,32 @@ Use inline Python as a normal lane for one-off Binary Ninja inspection that is a
 bn py exec --code "print(hex(bv.entry_point)); result = {'functions': len(list(bv.functions))}"
 ```
 
-Use `--stdin` for larger snippets. Use `--script <file>` only for real files.
+For multiline snippets, prefer `--stdin` with a quoted heredoc:
+
+Shell details matter here:
+- Quote the heredoc delimiter as `<<'PY'` so the shell does not expand `$vars`, backticks, or backslashes before Binary Ninja sees the Python.
+- Keep the closing `PY` on its own line with no indentation or trailing spaces.
+- Use `--script <file>` only for real files you want to keep on disk.
+- Avoid ordinary double-quoted multiline `--code "... \n ..."` strings; `--code` receives one shell argument, so `"\n"` stays a literal backslash-`n` pair instead of becoming a newline.
+
+Use this pattern for larger inspection snippets:
+
+```bash
+bn py exec --stdin <<'PY'
+out = []
+for f in bv.functions:
+    if 0x416000 <= f.start < 0x41C000:
+        out.append((f.start, f.symbol.short_name))
+out.sort()
+print("\n".join(f"{addr:#x} {name}" for addr, name in out))
+PY
+```
+
+If you really need inline multiline code without a heredoc, use ANSI-C quoting instead:
+
+```bash
+bn py exec --code $'print(hex(bv.entry_point))\nresult = {"functions": len(list(bv.functions))}'
+```
 
 `py exec` always returns `stdout` and `result`. If `result` is not JSON-serializable, the CLI returns `repr(result)` plus a warning instead of silently flattening it.
 
