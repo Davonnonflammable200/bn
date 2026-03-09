@@ -21,7 +21,9 @@ def test_function_list_defaults_to_active_target(monkeypatch, capsys):
     assert rc == 0
     assert captured["op"] == "list_functions"
     assert captured["target"] == "active"
-    assert "sub_401000" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert output == "0x401000  sub_401000\n"
+    assert '"name"' not in output
 
 
 def test_function_list_warns_on_truncation(monkeypatch, capsys):
@@ -39,7 +41,7 @@ def test_function_list_warns_on_truncation(monkeypatch, capsys):
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
 
-    rc = bn.cli.main(["function", "list"])
+    rc = bn.cli.main(["function", "list", "--format", "json"])
 
     assert rc == 0
     assert captured["op"] == "list_functions"
@@ -48,6 +50,17 @@ def test_function_list_warns_on_truncation(monkeypatch, capsys):
     assert len(payload) == 100
     assert "warning: function list output truncated to 100 items" in stderr
     assert "--offset 100" in stderr
+
+
+def test_parser_defaults_reads_to_text_and_mutations_to_json():
+    parser = bn.cli.build_parser()
+
+    assert parser.parse_args(["function", "list"]).format == "text"
+    assert parser.parse_args(["decompile", "sub_401000"]).format == "text"
+    assert parser.parse_args(["plugin", "install"]).format == "json"
+    assert parser.parse_args(["bundle", "function", "sub_401000"]).format == "json"
+    assert parser.parse_args(["symbol", "rename", "sub_401000", "player_update"]).format == "json"
+    assert parser.parse_args(["types", "declare", "typedef struct Player { int hp; } Player;"]).format == "json"
 
 
 def test_function_info_uses_active_target_and_text_renderer(monkeypatch, capsys):

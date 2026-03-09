@@ -20,11 +20,15 @@ def _package_version() -> str:
     return VERSION
 
 
-def _common_io_options(parser: argparse.ArgumentParser) -> None:
+def _common_io_options(
+    parser: argparse.ArgumentParser,
+    *,
+    default_format: str = "text",
+) -> None:
     parser.add_argument(
         "--format",
         choices=("json", "text", "ndjson"),
-        default="json",
+        default=default_format,
         help="Output format",
     )
     parser.add_argument("--out", type=Path, help="Write output to a file instead of stdout")
@@ -1215,7 +1219,7 @@ def build_parser() -> argparse.ArgumentParser:
     plugin_install.add_argument("--dest", type=Path, help="Custom install destination")
     plugin_install.add_argument("--mode", choices=("symlink", "copy"), default="symlink")
     plugin_install.add_argument("--force", action="store_true")
-    _common_io_options(plugin_install)
+    _common_io_options(plugin_install, default_format="json")
     plugin_install.set_defaults(handler=_plugin_install)
 
     target = subparsers.add_parser("target", help="Inspect Binary Ninja targets")
@@ -1292,7 +1296,7 @@ def build_parser() -> argparse.ArgumentParser:
     types_show.add_argument("type_name")
     types_show.set_defaults(handler=_types_show)
     types_declare = types_sub.add_parser("declare", help="Import C declarations as user types")
-    _common_io_options(types_declare)
+    _common_io_options(types_declare, default_format="json")
     _target_option(types_declare, required=False)
     types_declare.add_argument("--preview", action="store_true")
     types_declare.add_argument("--file", type=Path, help="Read declarations from a file")
@@ -1315,7 +1319,7 @@ def build_parser() -> argparse.ArgumentParser:
     bundle = subparsers.add_parser("bundle", help="Export reusable bundles")
     bundle_sub = bundle.add_subparsers(dest="bundle_command")
     bundle_function = bundle_sub.add_parser("function", help="Export a function bundle")
-    _common_io_options(bundle_function)
+    _common_io_options(bundle_function, default_format="json")
     _target_option(bundle_function, required=False)
     bundle_function.add_argument("identifier")
     bundle_function.set_defaults(handler=_bundle_function)
@@ -1334,7 +1338,7 @@ def build_parser() -> argparse.ArgumentParser:
     symbol = subparsers.add_parser("symbol", help="Rename functions or data")
     symbol_sub = symbol.add_subparsers(dest="symbol_command")
     symbol_rename = symbol_sub.add_parser("rename", help="Rename a symbol")
-    _common_io_options(symbol_rename)
+    _common_io_options(symbol_rename, default_format="json")
     _target_option(symbol_rename, required=False)
     symbol_rename.add_argument("--kind", choices=("auto", "function", "data"), default="auto")
     symbol_rename.add_argument("--preview", action="store_true")
@@ -1351,7 +1355,7 @@ def build_parser() -> argparse.ArgumentParser:
     comment_get.add_argument("--function")
     comment_get.set_defaults(handler=_comment_get)
     comment_set = comment_sub.add_parser("set", help="Set a comment")
-    _common_io_options(comment_set)
+    _common_io_options(comment_set, default_format="json")
     _target_option(comment_set, required=False)
     comment_set.add_argument("--preview", action="store_true")
     comment_set.add_argument("--address")
@@ -1359,7 +1363,7 @@ def build_parser() -> argparse.ArgumentParser:
     comment_set.add_argument("comment")
     comment_set.set_defaults(handler=_comment_set)
     comment_delete = comment_sub.add_parser("delete", help="Delete a comment")
-    _common_io_options(comment_delete)
+    _common_io_options(comment_delete, default_format="json")
     _target_option(comment_delete, required=False)
     comment_delete.add_argument("--preview", action="store_true")
     comment_delete.add_argument("--address")
@@ -1374,7 +1378,7 @@ def build_parser() -> argparse.ArgumentParser:
     proto_get.add_argument("identifier")
     proto_get.set_defaults(handler=_proto_get)
     proto_set = proto_sub.add_parser("set", help="Set a prototype")
-    _common_io_options(proto_set)
+    _common_io_options(proto_set, default_format="json")
     _target_option(proto_set, required=False)
     proto_set.add_argument("--preview", action="store_true")
     proto_set.add_argument("identifier")
@@ -1389,7 +1393,7 @@ def build_parser() -> argparse.ArgumentParser:
     local_list.add_argument("function")
     local_list.set_defaults(handler=_local_list)
     local_rename = local_sub.add_parser("rename", help="Rename a local")
-    _common_io_options(local_rename)
+    _common_io_options(local_rename, default_format="json")
     _target_option(local_rename, required=False)
     local_rename.add_argument("--preview", action="store_true")
     local_rename.add_argument("function")
@@ -1397,7 +1401,7 @@ def build_parser() -> argparse.ArgumentParser:
     local_rename.add_argument("new_name")
     local_rename.set_defaults(handler=_local_rename)
     local_retype = local_sub.add_parser("retype", help="Retype a local")
-    _common_io_options(local_retype)
+    _common_io_options(local_retype, default_format="json")
     _target_option(local_retype, required=False)
     local_retype.add_argument("--preview", action="store_true")
     local_retype.add_argument("function")
@@ -1415,7 +1419,7 @@ def build_parser() -> argparse.ArgumentParser:
     field = struct_sub.add_parser("field", help="Operate on struct fields")
     field_sub = field.add_subparsers(dest="struct_field_command")
     field_set = field_sub.add_parser("set", help="Set or replace a field")
-    _common_io_options(field_set)
+    _common_io_options(field_set, default_format="json")
     _target_option(field_set, required=False)
     field_set.add_argument("--preview", action="store_true")
     field_set.add_argument("--no-overwrite", action="store_true")
@@ -1425,7 +1429,7 @@ def build_parser() -> argparse.ArgumentParser:
     field_set.add_argument("field_type")
     field_set.set_defaults(handler=_struct_field_set)
     field_rename = field_sub.add_parser("rename", help="Rename a field")
-    _common_io_options(field_rename)
+    _common_io_options(field_rename, default_format="json")
     _target_option(field_rename, required=False)
     field_rename.add_argument("--preview", action="store_true")
     field_rename.add_argument("struct_name")
@@ -1433,7 +1437,7 @@ def build_parser() -> argparse.ArgumentParser:
     field_rename.add_argument("new_name")
     field_rename.set_defaults(handler=_struct_field_rename)
     field_delete = field_sub.add_parser("delete", help="Delete a field")
-    _common_io_options(field_delete)
+    _common_io_options(field_delete, default_format="json")
     _target_option(field_delete, required=False)
     field_delete.add_argument("--preview", action="store_true")
     field_delete.add_argument("struct_name")
@@ -1442,7 +1446,7 @@ def build_parser() -> argparse.ArgumentParser:
     batch = subparsers.add_parser("batch", help="Apply a batch manifest")
     batch_sub = batch.add_subparsers(dest="batch_command")
     batch_apply = batch_sub.add_parser("apply", help="Apply a JSON manifest")
-    _common_io_options(batch_apply)
+    _common_io_options(batch_apply, default_format="json")
     batch_apply.add_argument("--preview", action="store_true")
     batch_apply.add_argument("manifest", type=Path)
     batch_apply.set_defaults(handler=_batch_apply)

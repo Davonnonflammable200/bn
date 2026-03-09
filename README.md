@@ -84,6 +84,8 @@ Every command supports:
 - `--format ndjson`
 - `--out <path>`
 
+Interactive read commands default to `text`. Mutation, setup, and export commands default to `json`.
+
 Examples:
 
 ```bash
@@ -118,8 +120,8 @@ bn xrefs field TrackRowCell.tile_type
 bn comment get --address 0x401000
 
 bn types --query Player
-bn types show Player --format text
-bn struct show Player --format text
+bn types show Player
+bn struct show Player
 bn types declare --file /path/to/win32_min.h --preview
 bn strings --query follow
 bn imports
