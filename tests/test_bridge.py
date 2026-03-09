@@ -215,6 +215,35 @@ def test_refresh_updates_analysis_and_returns_target_info(monkeypatch):
     assert "refresh" in bv.events
 
 
+def test_diff_snapshots_marks_name_only_changes(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    diffs = instance._diff_snapshots(
+        {
+            0x401000: {
+                "name": "sub_401000",
+                "address": "0x401000",
+                "text": "return 7;",
+            }
+        },
+        {
+            0x401000: {
+                "name": "player_update",
+                "address": "0x401000",
+                "text": "return 7;",
+            }
+        },
+    )
+
+    assert len(diffs) == 1
+    assert diffs[0]["changed"] is True
+    assert diffs[0]["before_name"] == "sub_401000"
+    assert diffs[0]["after_name"] == "player_update"
+    assert diffs[0]["diff"] == "--- before:sub_401000\n+++ after:player_update"
+    assert "before_excerpt" not in diffs[0]
+
+
 def test_read_write_lock_blocks_reader_until_writer_releases(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     lock = bridge._ReadWriteLock()

@@ -1424,6 +1424,8 @@ class BinaryNinjaBridge:
         for address in sorted(set(before) | set(after)):
             old = before.get(address, {"text": ""})
             new = after.get(address, {"text": ""})
+            text_changed = old.get("text", "") != new.get("text", "")
+            name_changed = old.get("name") != new.get("name")
             diff = "\n".join(
                 difflib.unified_diff(
                     old["text"].splitlines(),
@@ -1433,16 +1435,23 @@ class BinaryNinjaBridge:
                     lineterm="",
                 )
             )
+            if not diff and name_changed:
+                diff = "\n".join(
+                    [
+                        f"--- before:{old.get('name', hex(address))}",
+                        f"+++ after:{new.get('name', hex(address))}",
+                    ]
+                )
             diffs.append(
                 {
                     "address": hex(address),
                     "before_name": old.get("name"),
                     "after_name": new.get("name"),
-                    "changed": old.get("text", "") != new.get("text", ""),
+                    "changed": bool(text_changed or name_changed),
                     "diff": diff,
                 }
             )
-            if diffs[-1]["changed"] and snippets_added < 3:
+            if text_changed and snippets_added < 3:
                 snippet = self._snippet_for_change(old.get("text", ""), new.get("text", ""))
                 if snippet is not None:
                     diffs[-1].update(snippet)
