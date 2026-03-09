@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import types
 
 import bn.cli
 import pytest
@@ -50,6 +51,51 @@ def test_function_list_returns_full_result_set(monkeypatch, capsys):
     payload = json.loads(stdout)
     assert len(payload) == 150
     assert stderr == ""
+
+
+def test_function_list_warns_when_output_auto_spills(monkeypatch, capsys):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+        captured["op"] = op
+        return {
+            "ok": True,
+            "result": [
+                {"name": "sub_401000", "address": "0x401000"},
+                {"name": "sub_402000", "address": "0x402000"},
+            ],
+        }
+
+    def fake_write_output_result(value, *, fmt, out_path, stem):
+        captured["value"] = value
+        captured["fmt"] = fmt
+        captured["out_path"] = out_path
+        captured["stem"] = stem
+        return types.SimpleNamespace(
+            rendered='{"artifact_path":"/tmp/functions.txt","bytes":1234,"format":"text","ok":true,"tokenizer":"o200k_base","tokens":23456}\n',
+            spilled=True,
+            artifact={
+                "artifact_path": "/tmp/functions.txt",
+                "bytes": 1234,
+                "format": "text",
+                "tokenizer": "o200k_base",
+                "tokens": 23456,
+            },
+        )
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    monkeypatch.setattr(bn.cli, "write_output_result", fake_write_output_result)
+
+    rc = bn.cli.main(["function", "list"])
+
+    assert rc == 0
+    stdout, stderr = capsys.readouterr()
+    assert '"artifact_path":"/tmp/functions.txt"' in stdout
+    assert captured["value"] == "0x401000  sub_401000\n0x402000  sub_402000"
+    assert "warning: function list output spilled to /tmp/functions.txt" in stderr
+    assert "tokens=23456" in stderr
+    assert "items=2" in stderr
+    assert "lines=2" in stderr
 
 
 def test_function_list_forwards_address_filters(monkeypatch, capsys):

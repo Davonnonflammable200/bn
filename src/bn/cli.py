@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 from typing import Any, Callable
 
-from .output import write_output
+from .output import write_output_result
 from .paths import plugin_install_dir, plugin_source_dir, skill_install_dir, skill_source_dir
 from .transport import BridgeError, _send_request_to_instance, list_instances, send_request
 from .version import VERSION, build_id_for_file
@@ -56,8 +56,28 @@ def _render_result(
     fmt: str,
     out_path: Path | None,
     stem: str,
+    spill_label: str | None = None,
+    spill_context: Any = None,
 ) -> None:
-    sys.stdout.write(write_output(value, fmt=fmt, out_path=out_path, stem=stem))
+    result = write_output_result(value, fmt=fmt, out_path=out_path, stem=stem)
+    sys.stdout.write(result.rendered)
+    if result.spilled and result.artifact:
+        artifact = result.artifact
+        details = [
+            f"format={artifact['format']}",
+            f"tokens={artifact['tokens']}",
+            f"bytes={artifact['bytes']}",
+            f"tokenizer={artifact['tokenizer']}",
+        ]
+        if isinstance(spill_context, list):
+            details.append(f"items={len(spill_context)}")
+        if isinstance(value, str):
+            details.append(f"lines={len(value.splitlines())}")
+        label = spill_label or stem.replace("_", " ")
+        print(
+            f"warning: {label} output spilled to {artifact['artifact_path']} ({', '.join(details)})",
+            file=sys.stderr,
+        )
 
 
 def _implicit_target(args: argparse.Namespace) -> str:
@@ -140,6 +160,7 @@ def _call(
             f"warning: {label} output truncated to {effective_page_limit} items; rerun with --offset {next_offset} or a larger --limit",
             file=sys.stderr,
         )
+    spill_context = result
     if text_renderer is not None and args.format == "text":
         result = text_renderer(result)
     _render_result(
@@ -147,6 +168,8 @@ def _call(
         fmt=args.format,
         out_path=None if bridge_writes_output else args.out,
         stem=stem,
+        spill_label=page_label or op.replace("_", " "),
+        spill_context=spill_context,
     )
     return exit_code
 
@@ -795,6 +818,7 @@ def _function_list(args: argparse.Namespace) -> int:
         params,
         require_target=True,
         text_renderer=_render_name_address_list_text,
+        page_label="function list",
         stem="functions",
     )
 
@@ -814,6 +838,7 @@ def _function_search(args: argparse.Namespace) -> int:
         params,
         require_target=True,
         text_renderer=_render_name_address_list_text,
+        page_label="function search",
         stem="function-search",
     )
 
