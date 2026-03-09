@@ -1054,7 +1054,6 @@ class BinaryNinjaBridge:
             **metadata,
             "parameters": parameters,
             "locals": locals_only,
-            "stack_vars": locals_only,
         }
 
     def _get_prototype(self, selector: str | None, identifier):

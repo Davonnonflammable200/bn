@@ -67,7 +67,6 @@ def test_function_info_uses_active_target_and_text_renderer(monkeypatch, capsys)
                 "size": 24,
                 "parameters": [{"name": "arg1", "type": "int32_t", "storage": 0, "is_parameter": True, "local_id": "0x401000:param:StackVariableSourceType:0:0:1"}],
                 "locals": [{"name": "var_4", "type": "int32_t", "storage": -4, "is_parameter": False, "local_id": "0x401000:local:StackVariableSourceType:-4:1:2"}],
-                "stack_vars": [{"name": "var_4", "type": "int32_t", "storage": -4, "is_parameter": False}],
             },
         }
 
