@@ -155,13 +155,3 @@ If you need to force BN to recalculate presentation after a type change, run:
 bn refresh
 ```
 
-## Practical Guidance
-
-- Prefer `bn` over MCP for shell-driven decompilation, search, bundles, and large outputs.
-- Read commands are shell-first now; use `--format json` only when you need stable fields.
-- Prefer stable `local_id` values from `bn local list` or `bn function info` when renaming or retyping locals.
-- `bn decompile` does not always rewrite post-hoc struct-growth sites away from raw `__offset(...)` expressions, even after a manual analysis refresh.
-- Treat `bn decompile` as the HLIL-text convenience lane; typed layouts live in `bn types show ...` and `bn struct show ...`.
-- Treat `bn types show ...` and `bn struct show ...` as the authoritative typed layouts when decompile output lags behind type recovery.
-- Keep writes sequential when you care about trustworthy preview diffs. Read-side concurrency is much safer than write-side concurrency.
-- If `bn target list` is empty, make sure Binary Ninja is open with a binary or `.bndb` loaded. If it is, check `bn plugin install`, then reload Binary Ninja plugins or restart Binary Ninja.
