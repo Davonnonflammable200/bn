@@ -154,7 +154,7 @@ Export a reusable function bundle:
 bn bundle function end_track_attachment_follow_state --out /tmp/end_track_attachment_follow_state.json
 ```
 
-Run Python inside the Binary Ninja process. This is a first-class workflow for one-off inspection and BN-native scripting, not just a fallback:
+Run Python inside the Binary Ninja process for one-off inspection and BN-native scripting:
 
 ```bash
 bn py exec --code "print(hex(bv.entry_point)); result = {'functions': len(list(bv.functions))}"
@@ -165,7 +165,7 @@ result = {"functions": len(list(bv.functions))}
 PY
 ```
 
-For multiline snippets, prefer `--stdin` or `--script`. `--code` receives one shell argument, so `"\n"` inside ordinary double quotes stays a literal backslash-`n` pair instead of becoming a newline.
+Use `--stdin` or `--script` for multiline Python snippets. Use `--code` for true one-liners only.
 
 ```bash
 bn py exec --stdin <<'PY'
@@ -176,9 +176,11 @@ for f in bv.functions:
 out.sort()
 print("\n".join(f"{addr:#x} {name}" for addr, name in out))
 PY
-
-bn py exec --code $'print(hex(bv.entry_point))\nresult = {"functions": len(list(bv.functions))}'
 ```
+
+Use a quoted heredoc for multiline Python snippets.
+
+When you need counts from BN iterators such as `f.hlil.instructions`, materialize them explicitly with `list(...)` or consume them with `sum(1 for ...)` instead of assuming sequence semantics.
 
 The `py exec` environment includes:
 
@@ -211,6 +213,15 @@ bn struct field set Player 0x308 movement_flag_selector uint32_t --preview
 Preview mode applies the change, refreshes analysis, captures affected decompile diffs, and then reverts the mutation.
 
 Non-preview writes only report success after reading the live BN session back and verifying that the requested post-state actually landed. If verification fails, the CLI returns a nonzero exit code and reverts the whole mutation or batch.
+
+After any live type or prototype mutation, do an explicit readback:
+
+```bash
+bn proto get sub_401000
+bn struct show Player
+bn types show Player
+bn decompile sub_401000
+```
 
 For declaration and struct mutations, preview results also include `affected_types` with before/after layouts and a unified diff. If a field edit is already identical, the result is marked with `changed: false` and a `No effective change detected` message.
 

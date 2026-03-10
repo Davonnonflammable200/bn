@@ -75,13 +75,14 @@ Use inline Python as a normal lane for one-off Binary Ninja inspection that is a
 bn py exec --code "print(hex(bv.entry_point)); result = {'functions': len(list(bv.functions))}"
 ```
 
-For multiline snippets, prefer `--stdin` with a quoted heredoc:
+Use `--stdin` with a quoted heredoc for multiline Python snippets:
 
 Shell details matter here:
 - Quote the heredoc delimiter as `<<'PY'` so the shell does not expand `$vars`, backticks, or backslashes before Binary Ninja sees the Python.
 - Keep the closing `PY` on its own line with no indentation or trailing spaces.
 - Use `--script <file>` only for real files you want to keep on disk.
-- Avoid ordinary double-quoted multiline `--code "... \n ..."` strings; `--code` receives one shell argument, so `"\n"` stays a literal backslash-`n` pair instead of becoming a newline.
+- Use `--code` for true one-liners only.
+- If you are counting or collecting BN iterators such as `f.hlil.instructions`, materialize them explicitly with `list(...)` or a generator consumption pattern instead of assuming random-access behavior.
 
 Use this pattern for larger inspection snippets:
 
@@ -94,12 +95,6 @@ for f in bv.functions:
 out.sort()
 print("\n".join(f"{addr:#x} {name}" for addr, name in out))
 PY
-```
-
-If you really need inline multiline code without a heredoc, use ANSI-C quoting instead:
-
-```bash
-bn py exec --code $'print(hex(bv.entry_point))\nresult = {"functions": len(list(bv.functions))}'
 ```
 
 The `py exec` environment includes:`bn`, `binaryninja`, `bv`, `result`.
@@ -133,6 +128,15 @@ If a struct edit is already identical, preview may report `changed: false` with 
 If a declaration only introduces functions or extern variables and no named types, `types declare` now reports a no-op instead of failing with `No named types found in declaration`.
 
 Non-preview writes are live-verified by default. If the requested state does not read back from Binary Ninja, the command exits nonzero and the whole mutation or batch is reverted.
+
+After any live type or prototype mutation, do an explicit readback:
+
+```bash
+bn proto get sub_401000
+bn struct show Player
+bn types show Player
+bn decompile sub_401000
+```
 
 Key result statuses:
 - `verified`
