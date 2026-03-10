@@ -100,9 +100,10 @@ class _FakeVariable:
 
 
 class _FakeBV:
-    def __init__(self, *, functions=None, symbols=None):
+    def __init__(self, *, functions=None, symbols=None, types_=None):
         self.functions = list(functions or [])
         self._symbols = list(symbols or [])
+        self.types = dict(types_ or {})
 
     def get_function_at(self, address: int):
         for fn in self.functions:
@@ -127,6 +128,30 @@ class _FakeBV:
             if int(symbol.address) == int(address):
                 return symbol
         return None
+
+    def get_type_by_name(self, name: str):
+        return self.types.get(str(name))
+
+    def define_user_type(self, name: str, type_obj):
+        self.types[str(name)] = type_obj
+
+
+class _FakeType:
+    def __init__(self, decl: str, *, width: int = 0, members=None, type_class: str = "StructureTypeClass"):
+        self._decl = decl
+        self.width = width
+        self.members = list(members) if members is not None else None
+        self.type_class = type_class
+
+    def __str__(self):
+        return self._decl
+
+
+class _FakeMember:
+    def __init__(self, offset: int, name: str, type_text: str):
+        self.offset = offset
+        self.name = name
+        self.type = type_text
 
 
 class _FakeMutationBV(_FakeBV):
@@ -321,6 +346,119 @@ def test_op_types_declare_accepts_source_without_named_types(monkeypatch):
     assert result["parsed_functions"] == ["DirectInput8Create"]
     assert result["parsed_variables"] == ["GUID_SysKeyboard"]
     assert bv.defined == []
+
+
+def test_op_types_declare_uses_canonical_defined_type_text(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    raw_type = _FakeType(
+        "struct",
+        width=0x2C,
+        members=[
+            _FakeMember(0x0, "state", "uint32_t"),
+            _FakeMember(0x10, "transition_progress", "float"),
+        ],
+    )
+
+    class _Platform:
+        def parse_types_from_source(self, source, **kwargs):
+            return _ParseResult(types={"DamageGaugeController": raw_type})
+
+    class _CanonicalizingBV(_FakeBV):
+        def __init__(self):
+            super().__init__()
+            self.platform = _Platform()
+
+        def parse_types_from_string(self, declaration):
+            raise AssertionError("string parser should not be used when source parsing succeeds")
+
+        def define_user_type(self, name, type_obj):
+            canonical = _FakeType(
+                f"struct {name}",
+                width=type_obj.width,
+                members=getattr(type_obj, "members", None),
+            )
+            super().define_user_type(name, canonical)
+
+    bv = _CanonicalizingBV()
+
+    result = instance._op_types_declare(
+        bv,
+        {
+            "op": "types_declare",
+            "declaration": "struct DamageGaugeController { int state; };",
+            "source_path": "/tmp/controller.h",
+        },
+    )
+
+    assert result["defined_types"] == {"DamageGaugeController": "struct DamageGaugeController"}
+    verified = instance._verify_operation(bv, result)
+    assert verified["status"] == "verified"
+    assert verified["observed"]["defined_types"]["DamageGaugeController"] == "struct DamageGaugeController"
+
+
+def test_op_set_prototype_uses_string_user_type_for_bn_compat(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    class _SetterFunction(_FakeFunction):
+        def __init__(self):
+            super().__init__(0x43F200, "update_garbage_hazard", "void* __fastcall(void* arg1)")
+            self.user_type_calls = []
+
+        def set_user_type(self, value):
+            self.user_type_calls.append(value)
+            if isinstance(value, str):
+                self.type = value
+
+    class _PrototypeBV(_FakeBV):
+        def parse_type_string(self, declaration):
+            return _FakeType("void* __thiscall(struct GarbageHazardRuntime* self)", type_class="FunctionTypeClass"), None
+
+    fn = _SetterFunction()
+    bv = _PrototypeBV(functions=[fn])
+
+    result = instance._op_set_prototype(
+        bv,
+        {
+            "op": "set_prototype",
+            "identifier": "update_garbage_hazard",
+            "prototype": "void* __thiscall update_garbage_hazard(struct GarbageHazardRuntime* self)",
+        },
+    )
+
+    assert fn.user_type_calls == ["void* __thiscall(struct GarbageHazardRuntime* self)"]
+    verified = instance._verify_operation(bv, result)
+    assert verified["status"] == "verified"
+    assert verified["observed"]["prototype"] == "void* __thiscall(struct GarbageHazardRuntime* self)"
+
+
+def test_resolve_type_field_accepts_offset_and_suggests_near_match(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(
+        types_={
+            "Player": _FakeType(
+                "struct Player",
+                width=0x5000,
+                members=[
+                    _FakeMember(0x380, "player_slot", "uint32_t"),
+                    _FakeMember(0x4340, "visible_life_stock", "uint32_t"),
+                ],
+            )
+        }
+    )
+
+    by_offset = instance._resolve_type_field(bv, "Player.0x4340")
+    assert by_offset["field_name"] == "visible_life_stock"
+    assert by_offset["offset"] == 0x4340
+
+    by_case = instance._resolve_type_field(bv, "Player.Visible_Life_Stock")
+    assert by_case["field_name"] == "visible_life_stock"
+
+    with pytest.raises(RuntimeError, match=r"Did you mean: visible_life_stock"):
+        instance._resolve_type_field(bv, "Player.visible_life_stok")
 
 
 def test_list_locals_returns_stable_ids(monkeypatch):

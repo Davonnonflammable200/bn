@@ -1207,16 +1207,48 @@ class BinaryNinjaBridge:
         if members is None:
             raise RuntimeError(f"Type is not a struct-like type: {resolved_name}")
 
-        for index, member in enumerate(list(members)):
-            if str(getattr(member, "name", "")) != field_name:
-                continue
+        member_list = list(members)
+
+        def field_info(member, index: int):
             return {
                 "type_name": resolved_name,
-                "field_name": field_name,
+                "field_name": str(getattr(member, "name", "")) or field_name,
                 "offset": int(getattr(member, "offset", 0)),
                 "member_index": index,
                 "field_type": str(getattr(member, "type", "")),
             }
+
+        for index, member in enumerate(member_list):
+            if str(getattr(member, "name", "")) != field_name:
+                continue
+            return field_info(member, index)
+
+        folded_matches = [
+            (index, member)
+            for index, member in enumerate(member_list)
+            if str(getattr(member, "name", "")).lower() == field_name.lower()
+        ]
+        if len(folded_matches) == 1:
+            index, member = folded_matches[0]
+            return field_info(member, index)
+
+        try:
+            requested_offset = _parse_address(field_name)
+        except Exception:
+            requested_offset = None
+        if requested_offset is not None:
+            for index, member in enumerate(member_list):
+                if int(getattr(member, "offset", 0)) != requested_offset:
+                    continue
+                return field_info(member, index)
+            raise RuntimeError(f"Field not found: {resolved_name}.0x{requested_offset:x}")
+
+        available = [str(getattr(member, "name", "")) for member in member_list if str(getattr(member, "name", ""))]
+        suggestions = difflib.get_close_matches(field_name, available, n=5, cutoff=0.5)
+        if suggestions:
+            raise RuntimeError(
+                f"Field not found: {resolved_name}.{field_name}. Did you mean: {', '.join(suggestions)}"
+            )
         raise RuntimeError(f"Field not found: {resolved_name}.{field_name}")
 
     def _field_xrefs(self, selector: str | None, field_spec: str):
@@ -1288,6 +1320,12 @@ class BinaryNinjaBridge:
             "decl": str(type_obj),
             "layout": self._render_type_layout(type_obj),
         }
+
+    def _current_type_entry(self, bv, type_name: str):
+        type_obj = bv.get_type_by_name(type_name)
+        if type_obj is None:
+            return None
+        return self._type_entry(type_name, type_obj)
 
     def _type_info(self, selector: str | None, type_name: str, *, require_struct: bool = False):
         bv = self._resolve_view(selector)
@@ -1981,6 +2019,7 @@ class BinaryNinjaBridge:
     def _verify_declared_types(self, bv, result: dict[str, Any]) -> dict[str, Any]:
         item = dict(result)
         defined_types = dict(item.get("defined_types") or {})
+        defined_type_layouts = dict(item.get("defined_type_layouts") or {})
         if not defined_types:
             item["observed"] = {
                 "defined_types": {},
@@ -1991,17 +2030,27 @@ class BinaryNinjaBridge:
             item["message"] = "Parsed declarations but no named types were defined."
             return item
         observed_types: dict[str, str | None] = {}
+        observed_type_layouts: dict[str, str | None] = {}
         for name, expected in defined_types.items():
             type_obj = bv.get_type_by_name(name)
             observed_types[name] = str(type_obj) if type_obj is not None else None
+            observed_type_layouts[name] = self._render_type_layout(type_obj) if type_obj is not None else None
             if observed_types[name] != expected:
+                if defined_type_layouts.get(name) and observed_type_layouts[name] == defined_type_layouts[name]:
+                    continue
                 raise OperationFailure(
                     "verification_failed",
                     f"Live type verification failed for {name}",
                     requested=item.get("requested"),
-                    observed={"defined_types": observed_types},
+                    observed={
+                        "defined_types": observed_types,
+                        "defined_type_layouts": observed_type_layouts,
+                    },
                 )
-        item["observed"] = {"defined_types": observed_types}
+        item["observed"] = {
+            "defined_types": observed_types,
+            "defined_type_layouts": observed_type_layouts,
+        }
         before = dict(item.get("before_defined_types") or {})
         item["status"] = "noop" if before and all(before.get(name) == expected for name, expected in defined_types.items()) else "verified"
         return item
@@ -2185,14 +2234,18 @@ class BinaryNinjaBridge:
         fn = self._find_function(bv, op["identifier"])
         expected_type, _ = bv.parse_type_string(str(op["prototype"]))
         before_prototype = str(fn.type)
-        if before_prototype != str(expected_type):
-            fn.set_user_type(expected_type)
+        expected_prototype = str(expected_type)
+        if before_prototype != expected_prototype:
+            try:
+                fn.set_user_type(expected_prototype)
+            except TypeError:
+                fn.set_user_type(expected_type)
         return {
             "op": "set_prototype",
             "function": fn.name,
             "address": hex(fn.start),
             "before_prototype": before_prototype,
-            "expected_prototype": str(expected_type),
+            "expected_prototype": expected_prototype,
             "requested": self._operation_requested(op),
         }
 
@@ -2322,15 +2375,19 @@ class BinaryNinjaBridge:
         )
         named_types = list(parsed["types"])
         defined_types = {}
+        defined_type_layouts = {}
         before_defined_types = {}
         for name, type_obj in named_types:
-            existing = bv.get_type_by_name(name)
-            before_defined_types[str(name)] = str(existing) if existing is not None else None
+            existing = self._current_type_entry(bv, str(name))
+            before_defined_types[str(name)] = existing["decl"] if existing is not None else None
             bv.define_user_type(name, type_obj)
-            defined_types[str(name)] = str(type_obj)
+            current = self._current_type_entry(bv, str(name))
+            defined_types[str(name)] = current["decl"] if current is not None else str(type_obj)
+            defined_type_layouts[str(name)] = current["layout"] if current is not None else self._render_type_layout(type_obj)
         return {
             "op": "types_declare",
             "defined_types": defined_types,
+            "defined_type_layouts": defined_type_layouts,
             "before_defined_types": before_defined_types,
             "count": len(defined_types),
             "parsed_functions": [name for name, _ in parsed["functions"]],
