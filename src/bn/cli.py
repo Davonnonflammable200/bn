@@ -532,6 +532,57 @@ def _render_xrefs_text(value: Any) -> str:
     return "\n".join(lines)
 
 
+def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False) -> str:
+    if not isinstance(value, list):
+        return _render_fallback_text(value)
+    if not value:
+        return "none"
+
+    blocks = []
+    for row in value:
+        if not isinstance(row, dict):
+            blocks.append(_render_fallback_text(row))
+            continue
+
+        callee = row.get("callee") if isinstance(row.get("callee"), dict) else {}
+        containing = row.get("containing_function") if isinstance(row.get("containing_function"), dict) else {}
+        call_addr = row.get("call_addr", "<unknown>")
+        caller_static = row.get("caller_static", "<unknown>")
+        primary = (
+            f"caller_static {caller_static} | call {call_addr}"
+            if prefer_caller_static
+            else f"call {call_addr} | caller_static {caller_static}"
+        )
+        lines = [
+            primary,
+            (
+                f"within: {containing.get('name', '<unknown>')} @ "
+                f"{containing.get('address', '<unknown>')}"
+            ),
+            f"callee: {callee.get('name', '<unknown>')} @ {callee.get('address', '<unknown>')}",
+        ]
+        if row.get("hlil_statement"):
+            lines.append(f"hlil: {row['hlil_statement']}")
+        if row.get("branch_context"):
+            lines.append(f"branch: {row['branch_context']}")
+
+        call_instruction = row.get("call_instruction") if isinstance(row.get("call_instruction"), dict) else {}
+        previous = list(row.get("previous_instructions") or [])
+        next_instructions = list(row.get("next_instructions") or [])
+        lines.append("context:")
+        for item in previous:
+            if isinstance(item, dict):
+                lines.append(f"  {item.get('address', '<unknown>')}  {item.get('text', '')}".rstrip())
+        lines.append(
+            f"> {call_instruction.get('address', '<unknown>')}  {call_instruction.get('text', '')}".rstrip()
+        )
+        for item in next_instructions:
+            if isinstance(item, dict):
+                lines.append(f"  {item.get('address', '<unknown>')}  {item.get('text', '')}".rstrip())
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
+
+
 def _render_type_list_text(value: Any) -> str:
     if not isinstance(value, list):
         return _render_fallback_text(value)
@@ -1009,6 +1060,44 @@ def _xrefs(args: argparse.Namespace) -> int:
     )
 
 
+def _load_within_identifiers(path: Path) -> list[str]:
+    identifiers = []
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        identifiers.append(line)
+    return identifiers
+
+
+def _callsites(args: argparse.Namespace) -> int:
+    if args.within is not None:
+        within_identifiers = [args.within]
+    else:
+        if args.within_file is None or not args.within_file.exists():
+            raise BridgeError(f"Scope file not found: {args.within_file}")
+        within_identifiers = _load_within_identifiers(args.within_file)
+        if not within_identifiers:
+            raise BridgeError(f"Scope file did not contain any function identifiers: {args.within_file}")
+
+    return _call(
+        args,
+        "callsites",
+        {
+            "callee": args.callee,
+            "within_identifiers": within_identifiers,
+            "context": args.context,
+            "caller_static": bool(args.caller_static),
+        },
+        require_target=True,
+        text_renderer=lambda value: _render_callsites_text(
+            value,
+            prefer_caller_static=bool(args.caller_static),
+        ),
+        stem="callsites",
+    )
+
+
 def _types(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -1461,6 +1550,26 @@ def build_parser() -> argparse.ArgumentParser:
     xrefs.add_argument("identifier", nargs="?")
     xrefs.add_argument("extra", nargs="*")
     xrefs.set_defaults(handler=_xrefs)
+
+    callsites = subparsers.add_parser("callsites", help="Find direct native callsites and exact caller_static addresses")
+    _common_io_options(callsites)
+    _target_option(callsites, required=False, default="active")
+    callsites.add_argument("callee")
+    scope = callsites.add_mutually_exclusive_group(required=True)
+    scope.add_argument("--within", help="Containing function to search for callsites")
+    scope.add_argument("--within-file", type=Path, help="Text file with one containing-function identifier per line")
+    callsites.add_argument(
+        "--context",
+        type=int,
+        default=3,
+        help="Number of previous and next instructions to include around each callsite",
+    )
+    callsites.add_argument(
+        "--caller-static",
+        action="store_true",
+        help="Prefer caller_static-first text output for return-address mapping workflows",
+    )
+    callsites.set_defaults(handler=_callsites)
 
     types = subparsers.add_parser("types", help="List or search types")
     _common_io_options(types)

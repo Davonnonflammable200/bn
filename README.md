@@ -4,7 +4,7 @@
 
 ## Headline Features
 
-- Query live Binary Ninja state from the shell: targets, functions, decompile text, IL, disassembly, xrefs, types, strings, imports, and reusable bundles.
+- Query live Binary Ninja state from the shell: targets, functions, callsites, decompile text, IL, disassembly, xrefs, types, strings, imports, and reusable bundles.
 - Execute Python inside the Binary Ninja process instead of maintaining a separate headless workflow.
 - Apply mutations with `--preview`, capture decompile diffs, and verify the live post-state before reporting success.
 - Emit structured `json` or `ndjson` output, auto-spill large results to files, and return token counts so agents can budget context intelligently.
@@ -123,6 +123,8 @@ bn function list --min-address 0x401000 --max-address 0x40ffff
 bn function search attachment
 bn function search --regex 'attach|detach|follow'
 bn function info end_track_attachment_follow_state
+bn callsites crt_rand --within bonus_pick_random_type
+bn callsites crt_rand --within-file /tmp/rng-functions.txt --format ndjson
 bn proto get end_track_attachment_follow_state
 bn local list end_track_attachment_follow_state
 bn refresh
@@ -143,6 +145,8 @@ bn imports
 ```
 
 `bn function search` stays case-insensitive substring matching by default. Add `--regex` when you need regular expressions. `bn function list` and `bn function search` both accept `--min-address` and `--max-address` to filter by function start address.
+
+`bn callsites` is the direct-call lane for exact return-address recovery. It reports both the native `call_addr` and the post-call `caller_static`, where `caller_static = call_addr + instruction_length`. Scope it with `--within <function>` or `--within-file <path>`; the file format is one function identifier per non-empty line, with `#` comments ignored.
 
 ## Bundles And Python
 

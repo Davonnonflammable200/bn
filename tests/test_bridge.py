@@ -78,6 +78,69 @@ class _FakeFunction:
         self.calling_convention = "__cdecl"
         self.return_type = "int32_t"
         self.basic_blocks = []
+        self.low_level_il = []
+
+
+class _FakeBasicBlock:
+    def __init__(self, start: int, end: int):
+        self.start = start
+        self.end = end
+
+
+class _FakeInstructionInfo:
+    def __init__(self, length: int):
+        self.length = length
+
+
+class _FakeArch:
+    def __init__(self, lengths=None):
+        self.max_instr_length = 16
+        self.lengths = dict(lengths or {})
+
+    def get_instruction_info(self, data, address):
+        return _FakeInstructionInfo(self.lengths.get(int(address), 1))
+
+
+class _FakeOperation:
+    def __init__(self, name: str):
+        self.name = name
+
+    def __str__(self):
+        return self.name
+
+
+class _FakeConstPtr:
+    def __init__(self, constant: int):
+        self.operation = _FakeOperation("LLIL_CONST_PTR")
+        self.constant = constant
+
+
+class _FakeReg:
+    def __init__(self, name: str):
+        self.operation = _FakeOperation("LLIL_REG")
+        self.name = name
+
+
+class _FakeHLILInstruction:
+    def __init__(self, text: str, *, condition=None, parent=None, expr_index: int = 0, instr_index: int = 0):
+        self.text = text
+        self.condition = condition
+        self.parent = parent
+        self.expr_index = expr_index
+        self.instr_index = instr_index
+
+    def __str__(self):
+        return self.text
+
+
+class _FakeLLILInstruction:
+    def __init__(self, address: int, dest, *, operation: str = "LLIL_CALL", hlils=None):
+        self.address = address
+        self.dest = dest
+        self.operation = _FakeOperation(operation)
+        self.hlils = list(hlils or [])
+        self.mlils = []
+        self.mapped_medium_level_il = None
 
 
 class _FakeVariable:
@@ -100,10 +163,13 @@ class _FakeVariable:
 
 
 class _FakeBV:
-    def __init__(self, *, functions=None, symbols=None, types_=None):
+    def __init__(self, *, functions=None, symbols=None, types_=None, arch=None, disassembly=None, instruction_lengths=None):
         self.functions = list(functions or [])
         self._symbols = list(symbols or [])
         self.types = dict(types_ or {})
+        self.arch = arch or _FakeArch(instruction_lengths)
+        self._disassembly = dict(disassembly or {})
+        self._instruction_lengths = dict(instruction_lengths or {})
 
     def get_function_at(self, address: int):
         for fn in self.functions:
@@ -134,6 +200,15 @@ class _FakeBV:
 
     def define_user_type(self, name: str, type_obj):
         self.types[str(name)] = type_obj
+
+    def get_instruction_length(self, address: int):
+        return self._instruction_lengths.get(int(address), 1)
+
+    def get_disassembly(self, address: int):
+        return self._disassembly.get(int(address), "")
+
+    def read(self, address: int, length: int):
+        return b"\x90" * length
 
 
 class _FakeType:
@@ -592,6 +667,128 @@ def test_search_functions_rejects_invalid_regex(monkeypatch):
 
     with pytest.raises(bridge.OperationFailure, match="Invalid function regex"):
         instance._search_functions("active", "(", regex=True)
+
+
+def test_callsites_returns_exact_caller_static_and_context(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    branch = _FakeHLILInstruction(
+        "if ((eax_3 & 0x3f) != 0)",
+        condition="(eax_3 & 0x3f) != 0",
+        expr_index=1,
+        instr_index=1,
+    )
+    statement = _FakeHLILInstruction(
+        "eax_3, edx_2 = crt_rand()",
+        parent=branch,
+        expr_index=2,
+        instr_index=2,
+    )
+    callee = _FakeFunction(0x461746, "crt_rand")
+    fn = _FakeFunction(0x412470, "bonus_pick_random_type")
+    fn.basic_blocks = [_FakeBasicBlock(0x41249C, 0x4124D8)]
+    fn.low_level_il = [
+        [
+            _FakeLLILInstruction(0x4124A0, _FakeConstPtr(0x461746), hlils=[statement]),
+            _FakeLLILInstruction(0x4124D1, _FakeConstPtr(0x461746)),
+        ]
+    ]
+    bv = _FakeBV(
+        functions=[callee, fn],
+        instruction_lengths={
+            0x41249C: 2,
+            0x41249E: 2,
+            0x4124A0: 5,
+            0x4124A5: 3,
+            0x4124D1: 5,
+            0x4124D6: 2,
+        },
+        disassembly={
+            0x41249C: "mov eax, 0",
+            0x41249E: "mov ebx, 0",
+            0x4124A0: "call crt_rand",
+            0x4124A5: "cmp eax, 0xd",
+            0x4124D1: "call crt_rand",
+            0x4124D6: "test al, 0x3f",
+        },
+    )
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    rows = instance._callsites(
+        "active",
+        "crt_rand",
+        within_identifiers=["bonus_pick_random_type"],
+        context=2,
+    )
+
+    assert [row["caller_static"] for row in rows] == ["0x4124a5", "0x4124d6"]
+    assert rows[0]["call_addr"] == "0x4124a0"
+    assert rows[0]["instruction_length"] == 5
+    assert rows[0]["hlil_statement"] == "eax_3, edx_2 = crt_rand()"
+    assert rows[0]["branch_context"] == "(eax_3 & 0x3f) != 0"
+    assert [item["address"] for item in rows[0]["previous_instructions"]] == ["0x41249c", "0x41249e"]
+    assert rows[0]["call_instruction"]["text"] == "call crt_rand"
+    assert [item["address"] for item in rows[0]["next_instructions"][:1]] == ["0x4124a5"]
+
+
+def test_callsites_within_file_scope_preserves_file_order_and_dedupes(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    callee = _FakeFunction(0x461746, "crt_rand")
+    alpha = _FakeFunction(0x401000, "alpha")
+    alpha.basic_blocks = [_FakeBasicBlock(0x401010, 0x401016)]
+    alpha.low_level_il = [[_FakeLLILInstruction(0x401010, _FakeConstPtr(0x461746))]]
+    beta = _FakeFunction(0x402000, "beta")
+    beta.basic_blocks = [_FakeBasicBlock(0x402020, 0x402026)]
+    beta.low_level_il = [[_FakeLLILInstruction(0x402020, _FakeConstPtr(0x461746))]]
+    bv = _FakeBV(
+        functions=[callee, alpha, beta],
+        instruction_lengths={0x401010: 5, 0x402020: 5},
+        disassembly={0x401010: "call crt_rand", 0x402020: "call crt_rand"},
+    )
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    rows = instance._callsites(
+        "active",
+        "crt_rand",
+        within_identifiers=["beta", "alpha", "beta"],
+        context=0,
+    )
+
+    assert [row["containing_function"]["name"] for row in rows] == ["beta", "alpha"]
+    assert [row["caller_static"] for row in rows] == ["0x402025", "0x401015"]
+
+
+def test_callsites_ignores_indirect_calls_and_returns_null_context_when_unmapped(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    callee = _FakeFunction(0x461746, "crt_rand")
+    fn = _FakeFunction(0x500000, "fx_queue_add_random")
+    fn.basic_blocks = [_FakeBasicBlock(0x500010, 0x50001A)]
+    fn.low_level_il = [
+        [
+            _FakeLLILInstruction(0x500010, _FakeReg("eax")),
+            _FakeLLILInstruction(0x500015, _FakeConstPtr(0x461746)),
+        ]
+    ]
+    bv = _FakeBV(
+        functions=[callee, fn],
+        instruction_lengths={0x500010: 5, 0x500015: 5},
+        disassembly={0x500010: "call eax", 0x500015: "call crt_rand"},
+    )
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    rows = instance._callsites(
+        "active",
+        "crt_rand",
+        within_identifiers=["fx_queue_add_random"],
+        context=1,
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["call_addr"] == "0x500015"
+    assert rows[0]["hlil_statement"] is None
+    assert rows[0]["branch_context"] is None
 
 
 def test_bridge_handler_swallows_broken_pipe(monkeypatch):

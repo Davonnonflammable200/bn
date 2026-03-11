@@ -94,6 +94,7 @@ READ_LOCKED_OPS = {
     "list_functions",
     "list_locals",
     "search_functions",
+    "callsites",
     "decompile",
     "il",
     "disasm",
@@ -542,6 +543,13 @@ class BinaryNinjaBridge:
                 min_address=params.get("min_address"),
                 max_address=params.get("max_address"),
             )
+        if op == "callsites":
+            return self._callsites(
+                target,
+                str(params["callee"]),
+                within_identifiers=list(params.get("within_identifiers") or []),
+                context=int(params.get("context", 3)),
+            )
         if op == "function_info":
             return self._function_info(target, params["identifier"])
         if op == "get_prototype":
@@ -702,6 +710,21 @@ class BinaryNinjaBridge:
             seen.add(marker)
             matches.append(fn)
         return matches
+
+    def _resolve_scope_functions(self, bv, identifiers: list[Any]) -> list[Any]:
+        if not identifiers:
+            raise OperationFailure("invalid_scope", "callsites requires at least one scoped function")
+
+        resolved = []
+        seen: set[int] = set()
+        for identifier in identifiers:
+            fn = self._find_function(bv, identifier)
+            marker = int(fn.start)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            resolved.append(fn)
+        return resolved
 
     def _find_symbols_by_name(self, bv, text: str, *, case_sensitive: bool) -> list[Any]:
         matches = []
@@ -925,12 +948,57 @@ class BinaryNinjaBridge:
             pass
         return str(func)
 
+    def _instruction_length(self, bv, address: int) -> int:
+        arch = getattr(bv, "arch", None)
+        try:
+            max_length = int(getattr(arch, "max_instr_length", 16) or 16)
+        except Exception:
+            max_length = 16
+
+        if arch is not None and hasattr(arch, "get_instruction_info"):
+            try:
+                data = bv.read(address, max_length)
+                info = arch.get_instruction_info(data, address)
+                length = int(getattr(info, "length", 0))
+                if length > 0:
+                    return length
+            except Exception:
+                pass
+
+        try:
+            length = int(bv.get_instruction_length(address))
+            if length > 0:
+                return length
+        except Exception:
+            pass
+        return 1
+
+    def _disasm_entry(self, bv, address: int) -> dict[str, Any]:
+        return {
+            "address": hex(int(address)),
+            "text": bv.get_disassembly(address) or "",
+        }
+
+    def _structured_disasm_entries(self, bv, func) -> list[dict[str, Any]]:
+        entries = []
+        for block in list(func.basic_blocks):
+            addr = int(block.start)
+            end = int(block.end)
+            while addr < end:
+                entry = self._disasm_entry(bv, addr)
+                if entry["text"]:
+                    entry["_address_int"] = addr
+                    entries.append(entry)
+                addr += max(1, self._instruction_length(bv, addr))
+        entries.sort(key=lambda item: int(item["_address_int"]))
+        return entries
+
     def _disasm_text(self, bv, func) -> str:
         lines = []
         for block in list(func.basic_blocks):
             addr = block.start
             while addr < block.end:
-                length = max(1, int(bv.get_instruction_length(addr)))
+                length = max(1, self._instruction_length(bv, int(addr)))
                 disasm = bv.get_disassembly(addr) or ""
                 raw = bv.read(addr, length)
                 hex_bytes = raw.hex(" ") if raw else ""
@@ -1014,8 +1082,223 @@ class BinaryNinjaBridge:
                 text = bv.get_comment_at(addr)
                 if text:
                     comments[hex(addr)] = text
-                addr += max(1, int(bv.get_instruction_length(addr)))
+                addr += max(1, self._instruction_length(bv, int(addr)))
         return comments
+
+    def _il_op_name(self, item) -> str:
+        operation = getattr(item, "operation", None)
+        name = getattr(operation, "name", None)
+        if name:
+            return str(name)
+        return str(operation)
+
+    def _llil_constant_value(self, expr) -> int | None:
+        if expr is None:
+            return None
+        if self._il_op_name(expr) not in {"LLIL_CONST", "LLIL_CONST_PTR"}:
+            return None
+        constant = getattr(expr, "constant", None)
+        if constant is not None:
+            return int(constant)
+        value = getattr(expr, "value", None)
+        if value is None:
+            return None
+        nested_value = getattr(value, "value", None)
+        if nested_value is not None:
+            return int(nested_value)
+        try:
+            return int(value)
+        except Exception:
+            return None
+
+    def _coerce_il_list(self, value: Any) -> list[Any]:
+        if value is None:
+            return []
+        if isinstance(value, (list, tuple, set)):
+            return list(value)
+        return [value]
+
+    def _iter_llil_instructions(self, func) -> list[Any]:
+        il = getattr(func, "low_level_il", None)
+        if il is None:
+            il = getattr(func, "llil", None)
+        if il is None:
+            return []
+
+        instructions = []
+        try:
+            blocks = list(il)
+        except Exception:
+            blocks = list(getattr(il, "basic_blocks", []) or [])
+        for block in blocks:
+            try:
+                instructions.extend(list(block))
+            except Exception:
+                continue
+        instructions.sort(key=lambda item: int(getattr(item, "address", 0)))
+        return instructions
+
+    def _hlil_candidates_for_llil(self, insn) -> list[Any]:
+        candidates = []
+        seen: set[tuple[str, int]] = set()
+
+        def add(candidate: Any) -> None:
+            if candidate is None:
+                return
+            expr_index = getattr(candidate, "expr_index", None)
+            marker = (type(candidate).__name__, int(expr_index) if expr_index is not None else id(candidate))
+            if marker in seen:
+                return
+            seen.add(marker)
+            candidates.append(candidate)
+
+        for attr in ("hlils", "hlil"):
+            for candidate in self._coerce_il_list(getattr(insn, attr, None)):
+                add(candidate)
+
+        mapped_mlil = getattr(insn, "mapped_medium_level_il", None)
+        if mapped_mlil is not None:
+            for attr in ("hlils", "hlil"):
+                for candidate in self._coerce_il_list(getattr(mapped_mlil, attr, None)):
+                    add(candidate)
+
+        for mlil in self._coerce_il_list(getattr(insn, "mlils", None)):
+            for attr in ("hlils", "hlil"):
+                for candidate in self._coerce_il_list(getattr(mlil, attr, None)):
+                    add(candidate)
+
+        return candidates
+
+    def _il_parent(self, instruction) -> Any | None:
+        for attr in ("parent", "parent_instruction"):
+            parent = getattr(instruction, attr, None)
+            if parent is not None and parent is not instruction:
+                return parent
+        return None
+
+    def _hlil_statement_text(self, insn) -> str | None:
+        candidates = self._hlil_candidates_for_llil(insn)
+        if not candidates:
+            return None
+
+        current = candidates[0]
+        seen: set[tuple[str, int]] = set()
+        while current is not None:
+            expr_index = getattr(current, "expr_index", None)
+            instr_index = getattr(current, "instr_index", None)
+            marker = (type(current).__name__, int(expr_index) if expr_index is not None else id(current))
+            if marker in seen:
+                break
+            seen.add(marker)
+            if expr_index is not None and instr_index is not None and int(expr_index) == int(instr_index):
+                return str(current)
+            parent = self._il_parent(current)
+            if parent is None:
+                return str(current)
+            current = parent
+        return str(candidates[0])
+
+    def _hlil_branch_context(self, insn) -> str | None:
+        candidates = self._hlil_candidates_for_llil(insn)
+        if not candidates:
+            return None
+
+        current = candidates[0]
+        seen: set[tuple[str, int]] = set()
+        while current is not None:
+            expr_index = getattr(current, "expr_index", None)
+            marker = (type(current).__name__, int(expr_index) if expr_index is not None else id(current))
+            if marker in seen:
+                break
+            seen.add(marker)
+            condition = getattr(current, "condition", None)
+            if condition is not None:
+                return str(condition)
+            current = self._il_parent(current)
+        return None
+
+    def _callsites_within_function(self, bv, callee, func, *, context: int) -> list[dict[str, Any]]:
+        disasm_entries = self._structured_disasm_entries(bv, func)
+        index_by_addr = {
+            int(item["_address_int"]): index for index, item in enumerate(disasm_entries)
+        }
+        callee_address = int(callee.start)
+        rows = []
+        for insn in self._iter_llil_instructions(func):
+            op_name = self._il_op_name(insn)
+            if op_name not in {"LLIL_CALL", "LLIL_CALL_STACK_ADJUST"}:
+                continue
+            dest_value = self._llil_constant_value(getattr(insn, "dest", None))
+            if dest_value != callee_address:
+                continue
+
+            call_addr = int(getattr(insn, "address", 0))
+            instruction_length = self._instruction_length(bv, call_addr)
+            caller_static = call_addr + instruction_length
+            disasm_index = index_by_addr.get(call_addr)
+            if disasm_index is None:
+                continue
+
+            previous = [
+                {
+                    "address": item["address"],
+                    "text": item["text"],
+                }
+                for item in disasm_entries[max(0, disasm_index - context) : disasm_index]
+            ]
+            next_instructions = [
+                {
+                    "address": item["address"],
+                    "text": item["text"],
+                }
+                for item in disasm_entries[disasm_index + 1 : disasm_index + 1 + context]
+            ]
+            call_instruction = {
+                "address": disasm_entries[disasm_index]["address"],
+                "text": disasm_entries[disasm_index]["text"],
+            }
+            rows.append(
+                {
+                    "callee": {
+                        "name": str(callee.name),
+                        "address": hex(callee_address),
+                    },
+                    "containing_function": {
+                        "name": str(func.name),
+                        "address": hex(int(func.start)),
+                    },
+                    "call_addr": hex(call_addr),
+                    "instruction_length": instruction_length,
+                    "caller_static": hex(caller_static),
+                    "call_instruction": call_instruction,
+                    "previous_instructions": previous,
+                    "next_instructions": next_instructions,
+                    "hlil_statement": self._hlil_statement_text(insn),
+                    "branch_context": self._hlil_branch_context(insn),
+                }
+            )
+        rows.sort(key=lambda item: int(item["call_addr"], 16))
+        return rows
+
+    def _callsites(
+        self,
+        selector: str | None,
+        callee_identifier: str,
+        *,
+        within_identifiers: list[Any],
+        context: int = 3,
+    ) -> list[dict[str, Any]]:
+        if context < 0:
+            raise OperationFailure("invalid_context", f"Invalid callsite context size: {context}")
+
+        bv = self._resolve_view(selector)
+        callee = self._find_function(bv, callee_identifier)
+        scope_functions = self._resolve_scope_functions(bv, within_identifiers)
+
+        rows = []
+        for func in scope_functions:
+            rows.extend(self._callsites_within_function(bv, callee, func, context=context))
+        return rows
 
     def _xrefs_to_address(self, bv, address: int) -> dict[str, Any]:
         code_refs = []

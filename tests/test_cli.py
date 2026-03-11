@@ -144,6 +144,7 @@ def test_parser_defaults_reads_to_text_and_mutations_to_json():
     parser = bn.cli.build_parser()
 
     assert parser.parse_args(["function", "list"]).format == "text"
+    assert parser.parse_args(["callsites", "crt_rand", "--within", "bonus_pick_random_type"]).format == "text"
     assert parser.parse_args(["decompile", "sub_401000"]).format == "text"
     assert parser.parse_args(["plugin", "install"]).format == "json"
     assert parser.parse_args(["skill", "install"]).format == "json"
@@ -161,6 +162,25 @@ def test_function_commands_do_not_accept_paging_flags():
 
     with pytest.raises(SystemExit):
         parser.parse_args(["function", "search", "--offset", "10", "attach"])
+
+
+def test_callsites_requires_exactly_one_scope_flag():
+    parser = bn.cli.build_parser()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["callsites", "crt_rand"])
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "callsites",
+                "crt_rand",
+                "--within",
+                "bonus_pick_random_type",
+                "--within-file",
+                "functions.txt",
+            ]
+        )
 
 
 def test_function_info_uses_active_target_and_text_renderer(monkeypatch, capsys):
@@ -503,6 +523,104 @@ def test_xrefs_text_format_renders_summary(monkeypatch, capsys):
     assert "xrefs to 0x401000" in output
     assert "- 0x402000 | sub_402000" in output
     assert "- 0x403000 | sub_403000" in output
+
+
+def test_callsites_routes_within_scope_and_renders_text(monkeypatch, capsys):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+        captured["op"] = op
+        captured["params"] = params
+        captured["target"] = target
+        return {
+            "ok": True,
+            "result": [
+                {
+                    "callee": {"name": "crt_rand", "address": "0x461746"},
+                    "containing_function": {
+                        "name": "bonus_pick_random_type",
+                        "address": "0x412470",
+                    },
+                    "call_addr": "0x4124a0",
+                    "instruction_length": 5,
+                    "caller_static": "0x4124a5",
+                    "call_instruction": {"address": "0x4124a0", "text": "call crt_rand"},
+                    "previous_instructions": [
+                        {"address": "0x41249c", "text": "mov eax, 0"},
+                    ],
+                    "next_instructions": [
+                        {"address": "0x4124a5", "text": "cmp eax, 0xd"},
+                    ],
+                    "hlil_statement": "edx_1:eax_1 = sx.q(crt_rand())",
+                    "branch_context": "mods.dp.d(edx_1:eax_1, 0xa2) + 1 s<= 0xd",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(
+        [
+            "callsites",
+            "--format",
+            "text",
+            "--target",
+            "active",
+            "--within",
+            "bonus_pick_random_type",
+            "--caller-static",
+            "crt_rand",
+        ]
+    )
+
+    assert rc == 0
+    assert captured["op"] == "callsites"
+    assert captured["target"] == "active"
+    assert captured["params"]["callee"] == "crt_rand"
+    assert captured["params"]["within_identifiers"] == ["bonus_pick_random_type"]
+    assert captured["params"]["context"] == 3
+    assert captured["params"]["caller_static"] is True
+    output = capsys.readouterr().out
+    assert output.startswith("caller_static 0x4124a5 | call 0x4124a0")
+    assert "within: bonus_pick_random_type @ 0x412470" in output
+    assert "hlil: edx_1:eax_1 = sx.q(crt_rand())" in output
+    assert "branch: mods.dp.d(edx_1:eax_1, 0xa2) + 1 s<= 0xd" in output
+    assert "> 0x4124a0  call crt_rand" in output
+
+
+def test_callsites_within_file_ignores_comments_and_blank_lines(monkeypatch, tmp_path):
+    captured = {}
+    scope_file = tmp_path / "functions.txt"
+    scope_file.write_text(
+        "\n# curated trial functions\nbonus_pick_random_type\n\nfx_queue_add_random\n",
+        encoding="utf-8",
+    )
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+        captured["op"] = op
+        captured["params"] = params
+        captured["target"] = target
+        return {"ok": True, "result": []}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(
+        [
+            "callsites",
+            "--target",
+            "active",
+            "--within-file",
+            str(scope_file),
+            "crt_rand",
+        ]
+    )
+
+    assert rc == 0
+    assert captured["op"] == "callsites"
+    assert captured["params"]["within_identifiers"] == [
+        "bonus_pick_random_type",
+        "fx_queue_add_random",
+    ]
 
 
 def test_comment_get_defaults_to_active_when_single_target_open(monkeypatch, capsys):
