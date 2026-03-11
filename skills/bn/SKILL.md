@@ -1,6 +1,6 @@
 ---
 name: bn
-description: Use the local bn CLI for Binary Ninja reversing work when a Binary Ninja GUI session is already open. Prefer this skill for decompilation, function search, IL/disassembly, xrefs, type inspection, struct field edits, previewed mutations, and inline Python execution through the bn bridge.
+description: Use the local bn CLI for Binary Ninja reversing work when a Binary Ninja GUI session is already open. Prefer this skill for decompilation, function search, callsite recovery, IL/disassembly, xrefs, type inspection, struct field edits, previewed mutations, and inline Python execution through the bn bridge.
 ---
 
 # bn
@@ -40,6 +40,8 @@ bn function list --min-address 0x401000 --max-address 0x40ffff
 bn function search attachment
 bn function search --regex 'attach|detach|follow'
 bn function info sample_track_floor_height_at_position
+bn callsites crt_rand --within bonus_pick_random_type
+bn callsites crt_rand --within-file /tmp/rng-functions.txt --format ndjson
 bn proto get sample_track_floor_height_at_position
 bn local list sample_track_floor_height_at_position
 bn decompile sample_track_floor_height_at_position
@@ -56,6 +58,35 @@ bn imports
 ```
 
 `bn function search` is case-insensitive substring matching by default. Add `--regex` when you need regular expressions. `bn function list` and `bn function search` both accept `--min-address` and `--max-address`.
+
+## Caller-Static Mapping
+
+Prefer `bn callsites` over ad hoc `py exec` when the task is "find exact native RNG return-address callers" or any similar direct-call mapping workflow.
+
+`bn callsites` reports both:
+- `call_addr`: the native `call ...` instruction address
+- `caller_static`: the exact post-call return address
+
+The key rule is:
+- `caller_static = call_addr + instruction_length`
+
+Use it like this:
+
+```bash
+bn callsites crt_rand --within bonus_pick_random_type --caller-static
+bn callsites crt_rand --within fx_queue_add_random --caller-static
+bn callsites crt_rand --within-file /tmp/rng-functions.txt --format json
+```
+
+The `--within-file` format is one function identifier per non-empty line. Lines beginning with `#` are ignored.
+
+For close-together callsites, `bn callsites` also returns:
+- previous instructions
+- next instructions
+- best-effort HLIL statement
+- best-effort enclosing branch condition
+
+Use `bn xrefs` when you only need inbound references. Use `bn callsites` when you need exact return-address recovery and local context around the call.
 
 ## Bundles
 
